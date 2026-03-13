@@ -1,6 +1,6 @@
 import json
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 def strip_code_fences(text: str) -> str:
@@ -100,6 +100,77 @@ def normalize_balance_setup(parsed: Dict[str, Any], default_currency: str) -> Di
     }
 
 
+def normalize_transfer(parsed: Dict[str, Any], default_currency: str) -> Dict[str, Any]:
+    intent = normalize_text(parsed.get("intent"), "").lower()
+    if intent != "transfer":
+        raise ValueError(f"Непідтримуваний intent: {intent}")
+
+    amount = normalize_amount(parsed.get("amount"))
+    currency = normalize_text(parsed.get("currency"), default_currency).upper()
+    source_account = normalize_text(parsed.get("source_account"), "")
+    destination_account = normalize_text(parsed.get("destination_account"), "")
+    description = normalize_text(parsed.get("description"), "Переказ між рахунками")
+
+    if not source_account:
+        raise ValueError("Claude не визначив рахунок-відправник")
+    if not destination_account:
+        raise ValueError("Claude не визначив рахунок-отримувач")
+    if source_account == destination_account:
+        raise ValueError("Рахунок-відправник і рахунок-отримувач однакові")
+
+    return {
+        "intent": "transfer",
+        "amount": amount,
+        "currency": currency,
+        "source_account": source_account,
+        "destination_account": destination_account,
+        "description": description,
+    }
+
+
+def normalize_last_transaction_action(parsed: Dict[str, Any], default_currency: str) -> Dict[str, Any]:
+    intent = normalize_text(parsed.get("intent"), "").lower()
+    if intent != "last_transaction_action":
+        raise ValueError(f"Непідтримуваний intent: {intent}")
+
+    action = normalize_text(parsed.get("action"), "").lower()
+    if action not in {"delete", "update"}:
+        raise ValueError(f"Непідтримуваний action: {action}")
+
+    amount = parsed.get("amount")
+    if amount is not None:
+        amount = normalize_amount(amount)
+
+    category = parsed.get("category")
+    if category is not None:
+        category = normalize_text(category, "")
+
+    description = parsed.get("description")
+    if description is not None:
+        description = normalize_text(description, "")
+
+    source_account = parsed.get("source_account")
+    if source_account is not None:
+        source_account = normalize_text(source_account, "")
+
+    destination_account = parsed.get("destination_account")
+    if destination_account is not None:
+        destination_account = normalize_text(destination_account, "")
+
+    currency = normalize_text(parsed.get("currency"), default_currency).upper()
+
+    return {
+        "intent": "last_transaction_action",
+        "action": action,
+        "amount": amount,
+        "currency": currency,
+        "category": category,
+        "description": description,
+        "source_account": source_account,
+        "destination_account": destination_account,
+    }
+
+
 def normalize_intent(parsed: Dict[str, Any]) -> str:
     intent = normalize_text(parsed.get("intent"), "").lower()
 
@@ -137,6 +208,42 @@ class ClaudeParser:
             "задати баланс",
             "зараз на рахунках",
             "залишки по рахунках",
+        ]
+
+        return any(trigger in low for trigger in triggers)
+
+    def looks_like_transfer_request(self, text: str) -> bool:
+        low = text.strip().lower()
+        triggers = [
+            "перевів",
+            "перекинув",
+            "переказав",
+            "скинув",
+            "скинула",
+            "перевела",
+            "перевести",
+            "перекинути",
+            "переказ",
+            "між рахунками",
+            "з рахунку",
+            "на рахунок",
+        ]
+        return any(trigger in low for trigger in triggers)
+
+    def looks_like_last_transaction_action_request(self, text: str) -> bool:
+        low = text.strip().lower()
+
+        if low.startswith("не з ") or low.startswith("не на "):
+            return True
+
+        triggers = [
+            "видали остан",
+            "зміни остан",
+            "останню транзакц",
+            "останню витрат",
+            "останній дохід",
+            "останній переказ",
+            "останньої транзакц",
         ]
 
         return any(trigger in low for trigger in triggers)
@@ -393,6 +500,149 @@ class ClaudeParser:
             default_currency=self.default_currency,
         )
         return normalized
+
+    async def parse_transfer_text(self, user_text: str, account_names: List[str]) -> Dict[str, Any]:
+        accounts_text = "\n".join(f"- {name}" for name in account_names)
+
+        prompt = f"""
+Ти парсер переказів між уже існуючими рахунками.
+Поверни СУВОРО лише JSON без markdown, без пояснень, без трійних лапок.
+
+Доступні рахунки:
+{accounts_text}
+
+Твоє завдання:
+- зрозуміти суму
+- вибрати ТОЧНІ назви source_account і destination_account тільки зі списку вище
+- враховувати неточності, скорочення, відмінки, цифри в назвах рахунків
+- не вигадувати нові рахунки
+
+Формат:
+{{
+  "intent": "transfer",
+  "amount": number,
+  "currency": "{self.default_currency}",
+  "source_account": "точна назва зі списку",
+  "destination_account": "точна назва зі списку",
+  "description": "рядок"
+}}
+
+Правила:
+- якщо написано "з X на Y", то X це source_account, Y це destination_account
+- якщо написано просто "перевів 2000 з 7097 каті", то 7097 це рахунок-відправник, а Каті це рахунок-отримувач
+- amount має бути числом
+- currency за замовчуванням "{self.default_currency}"
+- description короткий нормальний опис українською
+- source_account і destination_account мають бути тільки з доступного списку
+
+Приклад:
+Вхід: Перевів 2000 грн з 7097 каті
+Вихід:
+{{
+  "intent": "transfer",
+  "amount": 2000,
+  "currency": "{self.default_currency}",
+  "source_account": "Приватбанк 7097",
+  "destination_account": "Приватбанк Катя",
+  "description": "Переказ між рахунками"
+}}
+
+Повідомлення:
+{user_text}
+"""
+        parsed = await self._call_claude_json(prompt)
+        return normalize_transfer(parsed, default_currency=self.default_currency)
+
+    async def parse_last_transaction_action_text(self, user_text: str, account_names: List[str]) -> Dict[str, Any]:
+        accounts_text = "\n".join(f"- {name}" for name in account_names)
+
+        prompt = f"""
+Ти парсер команд для редагування або видалення ОСТАННЬОЇ транзакції.
+Поверни СУВОРО лише JSON без markdown, без пояснень, без трійних лапок.
+
+Доступні asset-рахунки:
+{accounts_text}
+
+Формат:
+{{
+  "intent": "last_transaction_action",
+  "action": "delete" | "update",
+  "amount": number | null,
+  "currency": "{self.default_currency}",
+  "category": "рядок" | null,
+  "description": "рядок" | null,
+  "source_account": "точна назва зі списку" | null,
+  "destination_account": "точна назва зі списку" | null
+}}
+
+Правила:
+- якщо користувач хоче видалити останню транзакцію, став action = "delete"
+- якщо користувач хоче змінити щось в останній транзакції, став action = "update"
+- якщо поле не треба змінювати, повертай null
+- source_account і destination_account можна повертати тільки зі списку вище
+- враховуй опечатки, скорочення, цифри в назвах рахунків
+- amount має бути числом або null
+- currency за замовчуванням "{self.default_currency}"
+
+Приклади:
+
+Вхід: видали останню транзакцію
+Вихід:
+{{
+  "intent": "last_transaction_action",
+  "action": "delete",
+  "amount": null,
+  "currency": "{self.default_currency}",
+  "category": null,
+  "description": null,
+  "source_account": null,
+  "destination_account": null
+}}
+
+Вхід: зміни останню витрату з 200 на 250
+Вихід:
+{{
+  "intent": "last_transaction_action",
+  "action": "update",
+  "amount": 250,
+  "currency": "{self.default_currency}",
+  "category": null,
+  "description": null,
+  "source_account": null,
+  "destination_account": null
+}}
+
+Вхід: зміни категорію останньої транзакції на Пальне
+Вихід:
+{{
+  "intent": "last_transaction_action",
+  "action": "update",
+  "amount": null,
+  "currency": "{self.default_currency}",
+  "category": "Пальне",
+  "description": null,
+  "source_account": null,
+  "destination_account": null
+}}
+
+Вхід: не з готівки, а з Приватбанк 7097
+Вихід:
+{{
+  "intent": "last_transaction_action",
+  "action": "update",
+  "amount": null,
+  "currency": "{self.default_currency}",
+  "category": null,
+  "description": null,
+  "source_account": "Приватбанк 7097",
+  "destination_account": null
+}}
+
+Повідомлення:
+{user_text}
+"""
+        parsed = await self._call_claude_json(prompt)
+        return normalize_last_transaction_action(parsed, default_currency=self.default_currency)
 
     async def answer_smalltalk(self, user_text: str) -> str:
         prompt = f"""
