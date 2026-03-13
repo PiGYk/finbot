@@ -1,707 +1,539 @@
-import json
-import re
-from typing import Any, Dict, List
+import asyncio
+import os
+from typing import Optional
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+
+from app.services.advisor import AdvisorService
+from app.services.budget_service import BudgetService
+from app.services.category_rules import CategoryRulesService
+from app.services.claude_parser import ClaudeParser
+from app.services.firefly_client import FireflyClient
+from app.services.pending_store import PendingStore
+from app.services.receipt_parser import ReceiptParser
+from app.services.reminder_service import ReminderService
+from app.services.reports import ReportService
+
+load_dotenv()
+
+app = FastAPI()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+
+CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "").strip()
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001").strip()
+
+FIREFLY_BASE_URL = os.getenv("FIREFLY_BASE_URL", "http://firefly:8080").rstrip("/")
+FIREFLY_ACCESS_TOKEN = os.getenv("FIREFLY_ACCESS_TOKEN", "").strip()
+
+DEFAULT_SOURCE_ACCOUNT = os.getenv("DEFAULT_SOURCE_ACCOUNT", "Готівка").strip()
+DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "UAH").strip()
+
+ALLOWED_CHAT_IDS_RAW = os.getenv("ALLOWED_CHAT_IDS", "").strip()
+CATEGORY_RULES_FILE = os.getenv("CATEGORY_RULES_FILE", "/app/data/category_rules.json").strip()
+REMINDER_DATA_FILE = os.getenv("REMINDER_DATA_FILE", "/app/data/reminders.json").strip()
+BUDGET_DATA_FILE = os.getenv("BUDGET_DATA_FILE", "/app/data/budgets.json").strip()
+BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Kyiv").strip()
+REMINDER_POLL_SECONDS = int(os.getenv("REMINDER_POLL_SECONDS", "30").strip())
+
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
+
+reminder_loop_task: Optional[asyncio.Task] = None
 
 
-def strip_code_fences(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return text.strip()
+def require_env(name: str, value: str) -> None:
+    if not value:
+        raise RuntimeError(f"{name} is not set")
 
 
-def normalize_amount(value: Any) -> float:
-    if value is None:
-        raise ValueError("Claude не визначив amount")
+def parse_allowed_chat_ids(raw: str) -> set[int]:
+    result: set[int] = set()
 
-    if isinstance(value, (int, float)):
-        amount = float(value)
-    else:
-        raw = str(value).strip()
-        raw = raw.replace("₴", "")
-        raw = raw.replace("грн", "")
-        raw = raw.replace("uah", "")
-        raw = raw.replace("UAH", "")
-        raw = raw.replace(",", ".")
-        raw = raw.replace(" ", "")
-        amount = float(raw)
+    if not raw:
+        return result
 
-    if amount < 0:
-        amount = abs(amount)
-
-    if amount == 0:
-        raise ValueError("amount = 0, це не схоже на нормальну суму")
-
-    return round(amount, 2)
-
-
-def normalize_text(value: Any, fallback: str) -> str:
-    if value is None:
-        return fallback
-    text = str(value).strip()
-    return text if text else fallback
-
-
-def normalize_parsed(parsed: Dict[str, Any], default_currency: str, default_source_account: str) -> Dict[str, Any]:
-    tx_type = normalize_text(parsed.get("type"), "").lower()
-    if tx_type not in {"expense", "income"}:
-        raise ValueError(f"Непідтримуваний type: {tx_type}")
-
-    amount = normalize_amount(parsed.get("amount"))
-    currency = normalize_text(parsed.get("currency"), default_currency).upper()
-    category = normalize_text(parsed.get("category"), "Інше")
-    description = normalize_text(parsed.get("description"), category)
-    source_account = normalize_text(parsed.get("source_account"), default_source_account)
-
-    return {
-        "type": tx_type,
-        "amount": amount,
-        "currency": currency,
-        "category": category,
-        "description": description,
-        "source_account": source_account,
-    }
-
-
-def normalize_balance_setup(parsed: Dict[str, Any], default_currency: str) -> Dict[str, Any]:
-    intent = normalize_text(parsed.get("intent"), "").lower()
-    if intent != "balance_setup":
-        raise ValueError(f"Непідтримуваний intent: {intent}")
-
-    accounts = parsed.get("accounts")
-    if not isinstance(accounts, list) or not accounts:
-        raise ValueError("Claude не повернув список accounts")
-
-    normalized_accounts: List[Dict[str, Any]] = []
-    for item in accounts:
-        if not isinstance(item, dict):
+    for part in raw.split(","):
+        value = part.strip()
+        if not value:
             continue
-
-        name = normalize_text(item.get("name"), "")
-        if not name:
-            continue
-
-        balance = normalize_amount(item.get("balance"))
-        currency = normalize_text(item.get("currency"), default_currency).upper()
-
-        normalized_accounts.append({
-            "name": name,
-            "balance": balance,
-            "currency": currency,
-        })
-
-    if not normalized_accounts:
-        raise ValueError("Після нормалізації список accounts порожній")
-
-    return {
-        "intent": "balance_setup",
-        "accounts": normalized_accounts,
-    }
-
-
-def normalize_transfer(parsed: Dict[str, Any], default_currency: str) -> Dict[str, Any]:
-    intent = normalize_text(parsed.get("intent"), "").lower()
-    if intent != "transfer":
-        raise ValueError(f"Непідтримуваний intent: {intent}")
-
-    amount = normalize_amount(parsed.get("amount"))
-    currency = normalize_text(parsed.get("currency"), default_currency).upper()
-    source_account = normalize_text(parsed.get("source_account"), "")
-    destination_account = normalize_text(parsed.get("destination_account"), "")
-    description = normalize_text(parsed.get("description"), "Переказ між рахунками")
-
-    if not source_account:
-        raise ValueError("Claude не визначив рахунок-відправник")
-    if not destination_account:
-        raise ValueError("Claude не визначив рахунок-отримувач")
-    if source_account == destination_account:
-        raise ValueError("Рахунок-відправник і рахунок-отримувач однакові")
-
-    return {
-        "intent": "transfer",
-        "amount": amount,
-        "currency": currency,
-        "source_account": source_account,
-        "destination_account": destination_account,
-        "description": description,
-    }
-
-
-def normalize_last_transaction_action(parsed: Dict[str, Any], default_currency: str) -> Dict[str, Any]:
-    intent = normalize_text(parsed.get("intent"), "").lower()
-    if intent != "last_transaction_action":
-        raise ValueError(f"Непідтримуваний intent: {intent}")
-
-    action = normalize_text(parsed.get("action"), "").lower()
-    if action not in {"delete", "update"}:
-        raise ValueError(f"Непідтримуваний action: {action}")
-
-    amount = parsed.get("amount")
-    if amount is not None:
-        amount = normalize_amount(amount)
-
-    target_index = parsed.get("target_index")
-    if target_index is not None:
         try:
-            target_index = int(target_index)
-        except (TypeError, ValueError):
-            target_index = None
-        if target_index is not None and target_index <= 0:
-            target_index = None
+            result.add(int(value))
+        except ValueError:
+            print(f"WARNING: invalid chat id in ALLOWED_CHAT_IDS: {value}")
 
-    category = parsed.get("category")
-    if category is not None:
-        category = normalize_text(category, "")
+    return result
 
-    description = parsed.get("description")
-    if description is not None:
-        description = normalize_text(description, "")
 
-    source_account = parsed.get("source_account")
-    if source_account is not None:
-        source_account = normalize_text(source_account, "")
+def is_chat_allowed(chat_id: int) -> bool:
+    if not ALLOWED_CHAT_IDS:
+        return True
+    return chat_id in ALLOWED_CHAT_IDS
 
-    destination_account = parsed.get("destination_account")
-    if destination_account is not None:
-        destination_account = normalize_text(destination_account, "")
 
-    target_category = parsed.get("target_category")
-    if target_category is not None:
-        target_category = normalize_text(target_category, "")
+require_env("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN)
+require_env("TELEGRAM_WEBHOOK_SECRET", TELEGRAM_WEBHOOK_SECRET)
+require_env("CLAUDE_API_KEY", CLAUDE_API_KEY)
+require_env("FIREFLY_ACCESS_TOKEN", FIREFLY_ACCESS_TOKEN)
 
-    target_description = parsed.get("target_description")
-    if target_description is not None:
-        target_description = normalize_text(target_description, "")
+ALLOWED_CHAT_IDS = parse_allowed_chat_ids(ALLOWED_CHAT_IDS_RAW)
 
-    currency = normalize_text(parsed.get("currency"), default_currency).upper()
+firefly = FireflyClient(
+    base_url=FIREFLY_BASE_URL,
+    access_token=FIREFLY_ACCESS_TOKEN,
+)
 
-    return {
-        "intent": "last_transaction_action",
-        "action": action,
-        "amount": amount,
-        "currency": currency,
-        "category": category,
-        "description": description,
-        "source_account": source_account,
-        "destination_account": destination_account,
-        "target_index": target_index,
-        "target_category": target_category,
-        "target_description": target_description,
+claude = ClaudeParser(
+    api_key=CLAUDE_API_KEY,
+    model=CLAUDE_MODEL,
+    default_currency=DEFAULT_CURRENCY,
+    default_source_account=DEFAULT_SOURCE_ACCOUNT,
+)
+
+reports = ReportService(
+    firefly=firefly,
+    default_currency=DEFAULT_CURRENCY,
+)
+
+advisor = AdvisorService(
+    firefly=firefly,
+    claude=claude,
+    default_currency=DEFAULT_CURRENCY,
+)
+
+category_rules = CategoryRulesService(file_path=CATEGORY_RULES_FILE)
+
+receipt_parser = ReceiptParser(
+    api_key=CLAUDE_API_KEY,
+    model=CLAUDE_MODEL,
+    default_currency=DEFAULT_CURRENCY,
+    category_rules=category_rules,
+)
+
+pending_store = PendingStore()
+
+reminder_service = ReminderService(
+    file_path=REMINDER_DATA_FILE,
+    timezone_name=BOT_TIMEZONE,
+    poll_seconds=REMINDER_POLL_SECONDS,
+)
+
+budget_service = BudgetService(
+    firefly=firefly,
+    default_currency=DEFAULT_CURRENCY,
+    file_path=BUDGET_DATA_FILE,
+)
+
+
+async def send_telegram_message(chat_id: int, text: str) -> None:
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+            },
+        )
+        response.raise_for_status()
+
+
+async def get_telegram_file_bytes(file_id: str) -> tuple[bytes, str]:
+    async with httpx.AsyncClient(timeout=60) as client:
+        meta_response = await client.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id})
+        meta_response.raise_for_status()
+        meta_data = meta_response.json()
+
+        if not meta_data.get("ok"):
+            raise ValueError(f"Telegram getFile failed: {meta_data}")
+
+        file_path = meta_data["result"]["file_path"]
+        download_response = await client.get(f"{TELEGRAM_FILE_API}/{file_path}")
+        download_response.raise_for_status()
+
+    lower = file_path.lower()
+    if lower.endswith(".png"):
+        media_type = "image/png"
+    elif lower.endswith(".webp"):
+        media_type = "image/webp"
+    elif lower.endswith(".gif"):
+        media_type = "image/gif"
+    else:
+        media_type = "image/jpeg"
+
+    return download_response.content, media_type
+
+
+def canonicalize_category(text: str) -> str:
+    return category_rules.resolve_category(text, fallback=text) or text
+
+
+def format_balance_setup_result(results: list[dict]) -> str:
+    lines = ["Оновив баланси:"]
+
+    for item in results:
+        action = item.get("action")
+        account = item.get("account")
+        currency = item.get("currency", "UAH")
+
+        if action == "created_with_opening_balance":
+            target = item.get("target_balance", 0)
+            lines.append(f"• {account}: створив новий рахунок зі стартовим балансом {target:.2f} {currency}")
+        elif action == "adjusted":
+            current = item.get("current_balance", 0)
+            target = item.get("target_balance", 0)
+            delta = item.get("delta", 0)
+            lines.append(
+                f"• {account}: було {current:.2f} {currency}, стало {target:.2f} {currency}, корекція {delta:+.2f} {currency}"
+            )
+        elif action == "no_change":
+            current = item.get("current_balance", 0)
+            lines.append(f"• {account}: без змін, уже {current:.2f} {currency}")
+        else:
+            lines.append(f"• {account}: невідомий результат")
+
+    return "\n".join(lines)
+
+
+def format_transfer_result(parsed: dict) -> str:
+    return (
+        f"Записав переказ: {parsed['amount']:.2f} {parsed['currency']}\n"
+        f"З: {parsed['source_account']}\n"
+        f"На: {parsed['destination_account']}\n"
+        f"Опис: {parsed['description']}"
+    )
+
+
+def format_last_transaction_action_result(result: dict) -> str:
+    action = result.get("action")
+    currency = result.get("currency", DEFAULT_CURRENCY)
+
+    if action == "deleted":
+        return (
+            f"Видалив останню транзакцію:\n"
+            f"• Тип: {result.get('old_type')}\n"
+            f"• Сума: {result.get('old_amount', 0):.2f} {currency}\n"
+            f"• Опис: {result.get('old_description')}"
+        )
+
+    if action == "deleted_split":
+        return (
+            f"Видалив частину останньої транзакції:\n"
+            f"• Частина: {result.get('target_label')}\n"
+            f"• Сума: {result.get('old_amount', 0):.2f} {currency}\n"
+            f"• Опис: {result.get('old_description')}"
+        )
+
+    if action == "updated":
+        lines = [
+            "Оновив частину останньої транзакції:" if result.get("target_label") else "Оновив останню транзакцію:",
+        ]
+
+        if result.get("target_label"):
+            lines.append(f"• Частина: {result.get('target_label')}")
+
+        lines.extend(
+            [
+                f"• Було: {result.get('old_amount', 0):.2f} {currency} | {result.get('old_description')}",
+                f"• Стало: {result.get('new_amount', 0):.2f} {currency} | {result.get('new_description')}",
+            ]
+        )
+
+        if result.get("old_source_account") != result.get("new_source_account"):
+            lines.append(
+                f"• Рахунок: {result.get('old_source_account')} → {result.get('new_source_account')}"
+            )
+
+        if result.get("old_destination_account") != result.get("new_destination_account"):
+            lines.append(
+                f"• Призначення: {result.get('old_destination_account')} → {result.get('new_destination_account')}"
+            )
+
+        if result.get("old_category") != result.get("new_category"):
+            lines.append(
+                f"• Категорія: {result.get('old_category')} → {result.get('new_category')}"
+            )
+
+        return "\n".join(lines)
+
+    return "Невідомий результат дії над останньою транзакцією."
+
+
+def format_receipt_preview(receipt: dict) -> str:
+    merchant = receipt.get("merchant") or "Чек"
+    currency = receipt.get("currency") or DEFAULT_CURRENCY
+    total = receipt.get("receipt_total", 0)
+    groups = receipt.get("category_totals", [])
+
+    lines = [
+        f"Розібрав чек: {merchant}",
+        f"Загальна сума: {total:.2f} {currency}",
+    ]
+
+    if groups:
+        lines.append("Попередній розподіл:")
+        for item in groups:
+            lines.append(f"• {item['category']} — {item['amount']:.2f} {currency}")
+
+    lines.append("")
+    lines.append("Напиши: «підтвердити чек» або «скасувати чек».")
+
+    return "\n".join(lines)
+
+
+def format_receipt_commit_result(receipt: dict, result: dict) -> str:
+    merchant = receipt.get("merchant") or "Чек"
+    currency = receipt.get("currency") or DEFAULT_CURRENCY
+    groups = result.get("groups", [])
+
+    lines = [f"Чек записав: {merchant}"]
+
+    if groups:
+        for item in groups:
+            lines.append(f"• {item['category']} — {item['amount']:.2f} {currency}")
+
+    return "\n".join(lines)
+
+
+def is_receipt_confirm_text(text: str) -> bool:
+    low = text.strip().lower()
+    return low in {
+        "підтвердити чек",
+        "підтвердити",
+        "ок",
+        "окей",
+        "записуй чек",
+        "записуй",
+        "так",
     }
 
 
-def normalize_category_create(parsed: Dict[str, Any]) -> Dict[str, Any]:
-    intent = normalize_text(parsed.get("intent"), "").lower()
-    if intent != "create_category":
-        raise ValueError(f"Непідтримуваний intent: {intent}")
-
-    canonical_name = normalize_text(parsed.get("canonical_name"), "")
-    if not canonical_name:
-        raise ValueError("Claude не визначив canonical_name для нової категорії")
-
-    aliases_raw = parsed.get("aliases")
-    aliases: List[str] = []
-
-    if isinstance(aliases_raw, list):
-        for item in aliases_raw:
-            alias = str(item or "").strip()
-            if alias:
-                aliases.append(alias)
-
-    if canonical_name not in aliases:
-        aliases.insert(0, canonical_name)
-
-    return {
-        "intent": "create_category",
-        "canonical_name": canonical_name,
-        "aliases": aliases,
+def is_receipt_cancel_text(text: str) -> bool:
+    low = text.strip().lower()
+    return low in {
+        "скасувати чек",
+        "скасувати",
+        "відміна",
+        "ні",
+        "не треба",
     }
 
 
-def normalize_reminder_create(parsed: Dict[str, Any]) -> Dict[str, Any]:
-    intent = normalize_text(parsed.get("intent"), "").lower()
-    if intent != "create_reminder":
-        raise ValueError(f"Непідтримуваний intent: {intent}")
+@app.on_event("startup")
+async def on_startup() -> None:
+    global reminder_loop_task
+    if reminder_loop_task is None:
+        reminder_loop_task = asyncio.create_task(reminder_service.run_forever(send_telegram_message))
 
-    kind = normalize_text(parsed.get("kind"), "daily").lower()
-    if kind != "daily":
-        raise ValueError("Поки що підтримується тільки daily reminder")
 
-    text = normalize_text(parsed.get("text"), "")
-    if not text:
-        raise ValueError("Claude не визначив текст нагадування")
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    global reminder_loop_task
+    if reminder_loop_task is not None:
+        reminder_loop_task.cancel()
+        try:
+            await reminder_loop_task
+        except asyncio.CancelledError:
+            pass
+        reminder_loop_task = None
+
+
+@app.get("/health")
+async def health() -> dict:
+    return {
+        "ok": True,
+        "whitelist_enabled": bool(ALLOWED_CHAT_IDS),
+        "allowed_chat_ids_count": len(ALLOWED_CHAT_IDS),
+        "category_rules_count": len(category_rules.list_rules()),
+        "reminders_count": reminder_service.count(),
+        "budgets_count": budget_service.count(),
+    }
+
+
+@app.post("/telegram/{secret}")
+async def telegram_webhook(secret: str, request: Request) -> dict:
+    if secret != TELEGRAM_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    update = await request.json()
+
+    message = update.get("message") or update.get("edited_message")
+    if not message:
+        return {"ok": True}
+
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    text = message.get("text")
+    photo = message.get("photo")
+
+    if not chat_id:
+        return {"ok": True}
+
+    if not is_chat_allowed(chat_id):
+        await send_telegram_message(
+            chat_id,
+            (
+                "Доступ заборонено.\n"
+                f"Твій chat_id: {chat_id}\n"
+                "Додай його в ALLOWED_CHAT_IDS у .env, якщо це довірений чат."
+            ),
+        )
+        return {"ok": True, "unauthorized_chat_id": chat_id}
 
     try:
-        hour = int(parsed.get("hour"))
-        minute = int(parsed.get("minute", 0))
-    except (TypeError, ValueError):
-        raise ValueError("Claude не визначив коректний час нагадування")
+        pending = await pending_store.get(chat_id)
 
-    if hour < 0 or hour > 23:
-        raise ValueError("Година нагадування має бути від 0 до 23")
+        if pending and pending.get("kind") == "receipt_confirm":
+            if photo:
+                await send_telegram_message(chat_id, "Спочатку підтвердь або скасуй попередній чек.")
+                return {"ok": True}
 
-    if minute < 0 or minute > 59:
-        raise ValueError("Хвилини нагадування мають бути від 0 до 59")
+            if not text:
+                await send_telegram_message(chat_id, "Напиши «підтвердити чек» або «скасувати чек».")
+                return {"ok": True}
 
-    return {
-        "intent": "create_reminder",
-        "kind": "daily",
-        "hour": hour,
-        "minute": minute,
-        "text": text,
-    }
+            if is_receipt_confirm_text(text):
+                receipt = pending["payload"]
+                result = await firefly.create_receipt_transactions(
+                    receipt=receipt,
+                    default_source_account=DEFAULT_SOURCE_ACCOUNT,
+                    default_currency=DEFAULT_CURRENCY,
+                )
+                await pending_store.clear(chat_id)
+                await send_telegram_message(chat_id, format_receipt_commit_result(receipt, result))
+                return {"ok": True}
 
+            if is_receipt_cancel_text(text):
+                await pending_store.clear(chat_id)
+                await send_telegram_message(chat_id, "Окей, чек скасовано. Нічого не записував.")
+                return {"ok": True}
 
-def normalize_budget_create(parsed: Dict[str, Any], default_currency: str) -> Dict[str, Any]:
-    intent = normalize_text(parsed.get("intent"), "").lower()
-    if intent != "create_budget":
-        raise ValueError(f"Непідтримуваний intent: {intent}")
+            await send_telegram_message(chat_id, "Спочатку підтвердь або скасуй чек.")
+            return {"ok": True}
 
-    amount = normalize_amount(parsed.get("amount"))
-    currency = normalize_text(parsed.get("currency"), default_currency).upper()
-    title = normalize_text(parsed.get("title"), "Новий бюджет")
+        if photo:
+            largest_photo = photo[-1]
+            file_id = largest_photo["file_id"]
+            image_bytes, media_type = await get_telegram_file_bytes(file_id)
+            parsed_receipt = await receipt_parser.parse_receipt_image(image_bytes, media_type)
+            await pending_store.set(chat_id, "receipt_confirm", parsed_receipt)
+            await send_telegram_message(chat_id, format_receipt_preview(parsed_receipt))
+            return {"ok": True}
 
-    return {
-        "intent": "create_budget",
-        "amount": amount,
-        "currency": currency,
-        "title": title,
-    }
+        if not text:
+            await send_telegram_message(chat_id, "Поки що я обробляю текстові повідомлення і фото чеків.")
+            return {"ok": True}
 
+        if claude.looks_like_balance_setup_request(text):
+            parsed_setup = await claude.parse_balance_setup_text(text)
+            results = await firefly.setup_balances(parsed_setup["accounts"])
+            await send_telegram_message(chat_id, format_balance_setup_result(results))
+            return {"ok": True}
 
-def normalize_intent(parsed: Dict[str, Any]) -> str:
-    intent = normalize_text(parsed.get("intent"), "").lower()
-    allowed = {
-        "finance_write",
-        "finance_query",
-        "finance_advice",
-        "smalltalk",
-    }
+        if claude.looks_like_category_create_request(text):
+            parsed_category = await claude.parse_category_create_text(text)
+            canonical_name = parsed_category["canonical_name"]
 
-    if intent not in allowed:
-        raise ValueError(f"Непідтримуваний intent router result: {intent}")
-
-    return intent
-
-
-class ClaudeParser:
-    def __init__(self, api_key: str, model: str, default_currency: str, default_source_account: str) -> None:
-        self.api_key = api_key
-        self.model = model
-        self.default_currency = default_currency
-        self.default_source_account = default_source_account
-        self.api_url = "https://api.anthropic.com/v1/messages"
-
-    def looks_like_balance_setup_request(self, text: str) -> bool:
-        low = text.strip().lower()
-        triggers = [
-            "початкові баланси",
-            "початковий баланс",
-            "стартові баланси",
-            "стартовий баланс",
-            "встанови баланс",
-            "онови баланс",
-            "задати баланс",
-            "зараз на рахунках",
-            "залишки по рахунках",
-        ]
-        return any(trigger in low for trigger in triggers)
-
-    def looks_like_transfer_request(self, text: str) -> bool:
-        low = text.strip().lower()
-        triggers = [
-            "перевів",
-            "перекинув",
-            "переказав",
-            "скинув",
-            "скинула",
-            "перевела",
-            "перевести",
-            "перекинути",
-            "переказ",
-            "між рахунками",
-            "з рахунку",
-            "на рахунок",
-        ]
-        return any(trigger in low for trigger in triggers)
-
-    def looks_like_last_transaction_action_request(self, text: str) -> bool:
-        low = text.strip().lower()
-
-        if low.startswith("не з ") or low.startswith("не на "):
-            return True
-
-        triggers = [
-            "видали остан",
-            "зміни остан",
-            "останню транзакц",
-            "останню витрат",
-            "останній дохід",
-            "останній переказ",
-            "останньої транзакц",
-            "останнього чеку",
-            "в останньому чеку",
-        ]
-        return any(trigger in low for trigger in triggers)
-
-    def looks_like_category_create_request(self, text: str) -> bool:
-        low = text.strip().lower()
-        return (
-            "категор" in low
-            and (
-                "додай нов" in low
-                or "створи нов" in low
-                or "додай категор" in low
-                or "створи категор" in low
+            await firefly.ensure_category(canonical_name)
+            rule = category_rules.upsert_rule(
+                canonical_name=canonical_name,
+                aliases=parsed_category["aliases"],
             )
-        )
 
-    def looks_like_reminder_request(self, text: str) -> bool:
-        low = text.strip().lower()
-        return "нагад" in low and ("кожен день" in low or "щодня" in low or "щоденно" in low)
+            await send_telegram_message(chat_id, category_rules.format_rule_result(rule))
+            return {"ok": True}
 
-    def looks_like_budget_create_request(self, text: str) -> bool:
-        low = text.strip().lower()
-        return (
-            "бюджет" in low
-            and (
-                "створи" in low
-                or "створити" in low
-                or "зроби" in low
-                or "розпиши" in low
-                or "розділи" in low
+        if claude.looks_like_reminder_request(text):
+            parsed_reminder = await claude.parse_reminder_create_text(text)
+            reminder = reminder_service.create_daily_reminder(
+                chat_id=chat_id,
+                text=parsed_reminder["text"],
+                hour=parsed_reminder["hour"],
+                minute=parsed_reminder["minute"],
             )
+            await send_telegram_message(chat_id, reminder_service.format_created_result(reminder))
+            return {"ok": True}
+
+        if claude.looks_like_budget_create_request(text):
+            parsed_budget = await claude.parse_budget_create_text(text)
+            budget = await budget_service.create_budget_plan(
+                chat_id=chat_id,
+                amount=parsed_budget["amount"],
+                title=parsed_budget["title"],
+            )
+            await send_telegram_message(chat_id, budget_service.format_plan(budget))
+            return {"ok": True}
+
+        if claude.looks_like_transfer_request(text):
+            account_names = await firefly.list_asset_account_names()
+            parsed_transfer = await claude.parse_transfer_text(text, account_names)
+            await firefly.create_transfer(parsed_transfer)
+            await send_telegram_message(chat_id, format_transfer_result(parsed_transfer))
+            return {"ok": True}
+
+        if claude.looks_like_last_transaction_action_request(text):
+            account_names = await firefly.list_asset_account_names()
+            action_spec = await claude.parse_last_transaction_action_text(text, account_names)
+
+            if action_spec.get("category"):
+                action_spec["category"] = canonicalize_category(action_spec["category"])
+
+            result = await firefly.apply_last_transaction_action(
+                action_spec=action_spec,
+                default_currency=DEFAULT_CURRENCY,
+                default_source_account=DEFAULT_SOURCE_ACCOUNT,
+            )
+            await send_telegram_message(chat_id, format_last_transaction_action_result(result))
+            return {"ok": True}
+
+        intent = await claude.parse_intent_text(text)
+
+        if intent == "smalltalk":
+            reply = await claude.answer_smalltalk(text)
+            await send_telegram_message(chat_id, reply)
+            return {"ok": True}
+
+        if intent == "finance_query":
+            report_reply = await reports.handle_report_request(text)
+            if report_reply:
+                await send_telegram_message(chat_id, report_reply)
+                return {"ok": True}
+
+            advice_reply = await advisor.answer_question(text)
+            await send_telegram_message(chat_id, advice_reply)
+            return {"ok": True}
+
+        if intent == "finance_advice":
+            advice_reply = await advisor.answer_question(text)
+            await send_telegram_message(chat_id, advice_reply)
+            return {"ok": True}
+
+        parsed = await claude.parse_transaction_text(text)
+        parsed["category"] = canonicalize_category(f"{parsed['description']} {parsed['category']}")
+        await firefly.create_transaction(parsed)
+
+        reply_text = (
+            f"Записав: {parsed['type']} | {parsed['amount']} {parsed['currency']} | "
+            f"{parsed['category']} | {parsed['description']} | рахунок: {parsed['source_account']}"
         )
 
-    async def _call_claude_json(self, prompt: str, max_tokens: int = 350) -> Dict[str, Any]:
-        import httpx
+        if budget_service.should_auto_suggest_after_income(text, parsed):
+            budget = await budget_service.create_budget_plan(
+                chat_id=chat_id,
+                amount=parsed["amount"],
+                title=f"План після доходу: {parsed['description']}",
+            )
+            reply_text += "\n\n" + budget_service.format_plan(
+                budget,
+                intro="Дохід записав. Рекомендую одразу так розкласти суму:",
+            )
 
-        headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
+        await send_telegram_message(chat_id, reply_text)
 
-        payload = {
-            "model": self.model,
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "messages": [{"role": "user", "content": prompt}],
-        }
+    except Exception as e:
+        print("ERROR =", repr(e))
+        await send_telegram_message(chat_id, f"Не зміг обробити повідомлення: {str(e)}")
 
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(self.api_url, headers=headers, json=payload)
-
-            if response.status_code >= 400:
-                raise Exception(f"Claude {response.status_code}: {response.text}")
-
-            data = response.json()
-
-        content_blocks = data.get("content", [])
-        if not content_blocks:
-            raise ValueError("Claude повернув порожню відповідь")
-
-        text_parts: List[str] = []
-        for block in content_blocks:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-
-        raw_text = "\n".join(text_parts).strip()
-        raw_text = strip_code_fences(raw_text)
-
-        try:
-            return json.loads(raw_text)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Claude повернув не JSON: {raw_text}") from e
-
-    async def _call_claude_text(self, prompt: str, max_tokens: int = 500) -> str:
-        import httpx
-
-        headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-
-        payload = {
-            "model": self.model,
-            "max_tokens": max_tokens,
-            "temperature": 0.3,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(self.api_url, headers=headers, json=payload)
-
-            if response.status_code >= 400:
-                raise Exception(f"Claude {response.status_code}: {response.text}")
-
-            data = response.json()
-
-        content_blocks = data.get("content", [])
-        if not content_blocks:
-            raise ValueError("Claude повернув порожню відповідь")
-
-        text_parts: List[str] = []
-        for block in content_blocks:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-
-        return "\n".join(text_parts).strip()
-
-    async def parse_intent_text(self, user_text: str) -> str:
-        prompt = f"""
-Ти роутер намірів для фінансового Telegram-бота.
-Поверни СУВОРО лише JSON без markdown.
-
-Формат:
-{{
-  "intent": "finance_write" | "finance_query" | "finance_advice" | "smalltalk"
-}}
-
-Пояснення категорій:
-- finance_write: користувач хоче ЗАПИСАТИ нову фінансову дію
-- finance_query: користувач хоче отримати цифри/звіт/статистику
-- finance_advice: користувач хоче аналіз, висновки, поради, рекомендації
-- smalltalk: звичайна розмова, не фінансова дія і не звіт
-
-Повідомлення:
-{user_text}
-"""
-        parsed = await self._call_claude_json(prompt, max_tokens=80)
-        return normalize_intent(parsed)
-
-    async def parse_transaction_text(self, user_text: str) -> Dict[str, Any]:
-        prompt = f"""
-Ти парсер коротких фінансових повідомлень українською.
-Поверни СУВОРО лише JSON без markdown, без пояснень, без трійних лапок.
-
-Формат:
-{{
-  "type": "expense" | "income",
-  "amount": number,
-  "currency": "{self.default_currency}",
-  "category": "рядок",
-  "description": "рядок",
-  "source_account": "{self.default_source_account}"
-}}
-
-Правила:
-- expense = витрата
-- income = дохід
-- amount має бути числом
-- якщо користувач поставив мінус, все одно повертай amount додатнім числом
-- currency за замовчуванням "{self.default_currency}"
-- category коротка і людська
-- description короткий нормальний опис
-- source_account за замовчуванням "{self.default_source_account}"
-
-Повідомлення:
-{user_text}
-"""
-        parsed = await self._call_claude_json(prompt)
-        return normalize_parsed(
-            parsed,
-            default_currency=self.default_currency,
-            default_source_account=self.default_source_account,
-        )
-
-    async def parse_balance_setup_text(self, user_text: str) -> Dict[str, Any]:
-        prompt = f"""
-Ти парсер запитів на встановлення стартових або поточних балансів рахунків.
-Поверни СУВОРО лише JSON без markdown, без пояснень, без трійних лапок.
-
-Формат:
-{{
-  "intent": "balance_setup",
-  "accounts": [
-    {{
-      "name": "назва рахунку",
-      "balance": number,
-      "currency": "{self.default_currency}"
-    }}
-  ]
-}}
-
-Повідомлення:
-{user_text}
-"""
-        parsed = await self._call_claude_json(prompt)
-        return normalize_balance_setup(parsed, default_currency=self.default_currency)
-
-    async def parse_transfer_text(self, user_text: str, account_names: List[str]) -> Dict[str, Any]:
-        accounts_text = "\n".join(f"- {name}" for name in account_names)
-
-        prompt = f"""
-Ти парсер переказів між уже існуючими рахунками.
-Поверни СУВОРО лише JSON без markdown, без пояснень, без трійних лапок.
-
-Доступні рахунки:
-{accounts_text}
-
-Формат:
-{{
-  "intent": "transfer",
-  "amount": number,
-  "currency": "{self.default_currency}",
-  "source_account": "точна назва зі списку",
-  "destination_account": "точна назва зі списку",
-  "description": "рядок"
-}}
-
-Повідомлення:
-{user_text}
-"""
-        parsed = await self._call_claude_json(prompt)
-        return normalize_transfer(parsed, default_currency=self.default_currency)
-
-    async def parse_last_transaction_action_text(self, user_text: str, account_names: List[str]) -> Dict[str, Any]:
-        accounts_text = "\n".join(f"- {name}" for name in account_names)
-
-        prompt = f"""
-Ти парсер команд для редагування або видалення останньої транзакції або її частини.
-Поверни СУВОРО лише JSON без markdown, без пояснень, без трійних лапок.
-
-Доступні asset-рахунки:
-{accounts_text}
-
-Формат:
-{{
-  "intent": "last_transaction_action",
-  "action": "delete" | "update",
-  "amount": number | null,
-  "currency": "{self.default_currency}",
-  "category": "рядок" | null,
-  "description": "рядок" | null,
-  "source_account": "точна назва зі списку" | null,
-  "destination_account": "точна назва зі списку" | null,
-  "target_index": number | null,
-  "target_category": "рядок" | null,
-  "target_description": "рядок" | null
-}}
-
-Повідомлення:
-{user_text}
-"""
-        parsed = await self._call_claude_json(prompt, max_tokens=500)
-        return normalize_last_transaction_action(parsed, default_currency=self.default_currency)
-
-    async def parse_category_create_text(self, user_text: str) -> Dict[str, Any]:
-        prompt = f"""
-Ти парсер команд на створення нової фінансової категорії.
-Поверни СУВОРО лише JSON без markdown.
-
-Формат:
-{{
-  "intent": "create_category",
-  "canonical_name": "канонічна назва категорії",
-  "aliases": ["аліас 1", "аліас 2", "аліас 3"]
-}}
-
-Правила:
-- canonical_name має бути чистою й красивою назвою категорії
-- aliases мають включати найпоширеніші варіанти написання, кирилицю, латиницю, дефіси, поширені помилки і скорочення
-
-Повідомлення:
-{user_text}
-"""
-        parsed = await self._call_claude_json(prompt, max_tokens=300)
-        return normalize_category_create(parsed)
-
-    async def parse_reminder_create_text(self, user_text: str) -> Dict[str, Any]:
-        prompt = f"""
-Ти парсер нагадувань для Telegram-бота.
-Поверни СУВОРО лише JSON без markdown.
-
-Формат:
-{{
-  "intent": "create_reminder",
-  "kind": "daily",
-  "hour": 9,
-  "minute": 0,
-  "text": "текст нагадування"
-}}
-
-Правила:
-- поки що підтримуємо лише щоденні нагадування
-- якщо користувач пише "о 9", minute = 0
-- текст нагадування має бути коротким і зрозумілим
-
-Приклад:
-Вхід: нагадуй мені кожен день о 9 ранку відкладати 500 грн
-Вихід:
-{{
-  "intent": "create_reminder",
-  "kind": "daily",
-  "hour": 9,
-  "minute": 0,
-  "text": "Відкласти 500 грн"
-}}
-
-Повідомлення:
-{user_text}
-"""
-        parsed = await self._call_claude_json(prompt, max_tokens=200)
-        return normalize_reminder_create(parsed)
-
-    async def parse_budget_create_text(self, user_text: str) -> Dict[str, Any]:
-        prompt = f"""
-Ти парсер команд на створення бюджет-плану.
-Поверни СУВОРО лише JSON без markdown.
-
-Формат:
-{{
-  "intent": "create_budget",
-  "amount": number,
-  "currency": "{self.default_currency}",
-  "title": "назва бюджету"
-}}
-
-Приклад:
-Вхід: створи бюджет на 30000
-Вихід:
-{{
-  "intent": "create_budget",
-  "amount": 30000,
-  "currency": "{self.default_currency}",
-  "title": "Бюджет на 30000"
-}}
-
-Повідомлення:
-{user_text}
-"""
-        parsed = await self._call_claude_json(prompt, max_tokens=180)
-        return normalize_budget_create(parsed, default_currency=self.default_currency)
-
-    async def answer_smalltalk(self, user_text: str) -> str:
-        prompt = f"""
-Ти Telegram-бот з фінансовим ухилом.
-Відповідай коротко, природно, українською.
-Не вигадуй фінансові дані, якщо тебе про них не питали.
-Не намагайся записувати транзакцію.
-
-Повідомлення користувача:
-{user_text}
-"""
-        return await self._call_claude_text(prompt, max_tokens=120)
-
-    async def answer_finance_advice(self, user_text: str, context_json: str) -> str:
-        prompt = f"""
-Ти фінансовий помічник користувача.
-Тобі дано зведений фінансовий контекст у JSON.
-На основі нього дай коротку, практичну відповідь українською.
-
-Правила:
-- не вигадуй дані поза контекстом
-- якщо даних мало, чесно так і скажи
-- давай конкретні висновки і 2-4 практичні рекомендації
-- не будь занадто багатослівним
-
-Питання користувача:
-{user_text}
-
-Контекст:
-{context_json}
-"""
-        return await self._call_claude_text(prompt, max_tokens=500)
+    return {"ok": True}
