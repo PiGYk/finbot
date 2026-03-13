@@ -200,11 +200,11 @@ def normalize_category_create(parsed: Dict[str, Any]) -> Dict[str, Any]:
     if not canonical_name:
         raise ValueError("Claude не визначив canonical_name для нової категорії")
 
-    raw_aliases = parsed.get("aliases")
+    aliases_raw = parsed.get("aliases")
     aliases: List[str] = []
 
-    if isinstance(raw_aliases, list):
-        for item in raw_aliases:
+    if isinstance(aliases_raw, list):
+        for item in aliases_raw:
             alias = str(item or "").strip()
             if alias:
                 aliases.append(alias)
@@ -219,9 +219,59 @@ def normalize_category_create(parsed: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def normalize_reminder_create(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    intent = normalize_text(parsed.get("intent"), "").lower()
+    if intent != "create_reminder":
+        raise ValueError(f"Непідтримуваний intent: {intent}")
+
+    kind = normalize_text(parsed.get("kind"), "daily").lower()
+    if kind != "daily":
+        raise ValueError("Поки що підтримується тільки daily reminder")
+
+    text = normalize_text(parsed.get("text"), "")
+    if not text:
+        raise ValueError("Claude не визначив текст нагадування")
+
+    try:
+        hour = int(parsed.get("hour"))
+        minute = int(parsed.get("minute", 0))
+    except (TypeError, ValueError):
+        raise ValueError("Claude не визначив коректний час нагадування")
+
+    if hour < 0 or hour > 23:
+        raise ValueError("Година нагадування має бути від 0 до 23")
+
+    if minute < 0 or minute > 59:
+        raise ValueError("Хвилини нагадування мають бути від 0 до 59")
+
+    return {
+        "intent": "create_reminder",
+        "kind": "daily",
+        "hour": hour,
+        "minute": minute,
+        "text": text,
+    }
+
+
+def normalize_budget_create(parsed: Dict[str, Any], default_currency: str) -> Dict[str, Any]:
+    intent = normalize_text(parsed.get("intent"), "").lower()
+    if intent != "create_budget":
+        raise ValueError(f"Непідтримуваний intent: {intent}")
+
+    amount = normalize_amount(parsed.get("amount"))
+    currency = normalize_text(parsed.get("currency"), default_currency).upper()
+    title = normalize_text(parsed.get("title"), "Новий бюджет")
+
+    return {
+        "intent": "create_budget",
+        "amount": amount,
+        "currency": currency,
+        "title": title,
+    }
+
+
 def normalize_intent(parsed: Dict[str, Any]) -> str:
     intent = normalize_text(parsed.get("intent"), "").lower()
-
     allowed = {
         "finance_write",
         "finance_query",
@@ -293,7 +343,6 @@ class ClaudeParser:
             "останнього чеку",
             "в останньому чеку",
         ]
-
         return any(trigger in low for trigger in triggers)
 
     def looks_like_category_create_request(self, text: str) -> bool:
@@ -305,6 +354,23 @@ class ClaudeParser:
                 or "створи нов" in low
                 or "додай категор" in low
                 or "створи категор" in low
+            )
+        )
+
+    def looks_like_reminder_request(self, text: str) -> bool:
+        low = text.strip().lower()
+        return "нагад" in low and ("кожен день" in low or "щодня" in low or "щоденно" in low)
+
+    def looks_like_budget_create_request(self, text: str) -> bool:
+        low = text.strip().lower()
+        return (
+            "бюджет" in low
+            and (
+                "створи" in low
+                or "створити" in low
+                or "зроби" in low
+                or "розпиши" in low
+                or "розділи" in low
             )
         )
 
@@ -395,10 +461,10 @@ class ClaudeParser:
 }}
 
 Пояснення категорій:
-- finance_write: користувач хоче ЗАПИСАТИ нову фінансову дію. Приклади: "кава 200", "зарплата 30000", "АТБ 540"
-- finance_query: користувач хоче отримати цифри/звіт/статистику. Приклади: "скільки я витратив за тиждень", "топ категорії"
-- finance_advice: користувач хоче аналіз, висновки, поради, рекомендації. Приклади: "на що мені зменшити витрати", "що в мене не так по витратах"
-- smalltalk: звичайна розмова, не фінансова дія і не звіт. Приклади: "як справи", "шо нового", "ти тут?"
+- finance_write: користувач хоче ЗАПИСАТИ нову фінансову дію
+- finance_query: користувач хоче отримати цифри/звіт/статистику
+- finance_advice: користувач хоче аналіз, висновки, поради, рекомендації
+- smalltalk: звичайна розмова, не фінансова дія і не звіт
 
 Повідомлення:
 {user_text}
@@ -458,15 +524,6 @@ class ClaudeParser:
   ]
 }}
 
-Правила:
-- intent завжди "balance_setup"
-- accounts це список рахунків
-- balance має бути числом
-- currency за замовчуванням "{self.default_currency}"
-- назви рахунків короткі та людські
-- якщо в тексті кілька рахунків, поверни кілька об'єктів у accounts
-- якщо є мінус, повертай balance додатнім числом
-
 Повідомлення:
 {user_text}
 """
@@ -492,11 +549,6 @@ class ClaudeParser:
   "destination_account": "точна назва зі списку",
   "description": "рядок"
 }}
-
-Правила:
-- враховуй неточності, скорочення, відмінки, цифри в назвах рахунків
-- не вигадуй нові рахунки
-- якщо написано "з X на Y", то X це source_account, Y це destination_account
 
 Повідомлення:
 {user_text}
@@ -538,7 +590,7 @@ class ClaudeParser:
     async def parse_category_create_text(self, user_text: str) -> Dict[str, Any]:
         prompt = f"""
 Ти парсер команд на створення нової фінансової категорії.
-Поверни СУВОРО лише JSON без markdown, без пояснень, без трійних лапок.
+Поверни СУВОРО лише JSON без markdown.
 
 Формат:
 {{
@@ -548,29 +600,79 @@ class ClaudeParser:
 }}
 
 Правила:
-- canonical_name має бути людською, чистою, красивою назвою категорії
-- якщо це відомий бренд або товар, можна нормалізувати написання, наприклад:
-  - "кока кола" -> "Coca Cola"
-  - "ред бул" -> "Red Bull"
-  - "монстер" -> "Monster Energy"
-- aliases мають включати найпоширеніші варіанти написання, зокрема кирилицю, латиницю, дефіси, поширені помилки і скорочення
-- не вигадуй занадто довгий список, достатньо 5-12 розумних варіантів
-- aliases мають допомагати майбутньому розпізнаванню в тексті та на чеках
-
-Приклад:
-Вхід: додай нову категорію Кока кола
-Вихід:
-{{
-  "intent": "create_category",
-  "canonical_name": "Coca Cola",
-  "aliases": ["Coca Cola", "Coca-Cola", "coca cola", "cola", "кока кола", "кока-кола", "кокак кола"]
-}}
+- canonical_name має бути чистою й красивою назвою категорії
+- aliases мають включати найпоширеніші варіанти написання, кирилицю, латиницю, дефіси, поширені помилки і скорочення
 
 Повідомлення:
 {user_text}
 """
         parsed = await self._call_claude_json(prompt, max_tokens=300)
         return normalize_category_create(parsed)
+
+    async def parse_reminder_create_text(self, user_text: str) -> Dict[str, Any]:
+        prompt = f"""
+Ти парсер нагадувань для Telegram-бота.
+Поверни СУВОРО лише JSON без markdown.
+
+Формат:
+{{
+  "intent": "create_reminder",
+  "kind": "daily",
+  "hour": 9,
+  "minute": 0,
+  "text": "текст нагадування"
+}}
+
+Правила:
+- поки що підтримуємо лише щоденні нагадування
+- якщо користувач пише "о 9", minute = 0
+- текст нагадування має бути коротким і зрозумілим
+
+Приклад:
+Вхід: нагадуй мені кожен день о 9 ранку відкладати 500 грн
+Вихід:
+{{
+  "intent": "create_reminder",
+  "kind": "daily",
+  "hour": 9,
+  "minute": 0,
+  "text": "Відкласти 500 грн"
+}}
+
+Повідомлення:
+{user_text}
+"""
+        parsed = await self._call_claude_json(prompt, max_tokens=200)
+        return normalize_reminder_create(parsed)
+
+    async def parse_budget_create_text(self, user_text: str) -> Dict[str, Any]:
+        prompt = f"""
+Ти парсер команд на створення бюджет-плану.
+Поверни СУВОРО лише JSON без markdown.
+
+Формат:
+{{
+  "intent": "create_budget",
+  "amount": number,
+  "currency": "{self.default_currency}",
+  "title": "назва бюджету"
+}}
+
+Приклад:
+Вхід: створи бюджет на 30000
+Вихід:
+{{
+  "intent": "create_budget",
+  "amount": 30000,
+  "currency": "{self.default_currency}",
+  "title": "Бюджет на 30000"
+}}
+
+Повідомлення:
+{user_text}
+"""
+        parsed = await self._call_claude_json(prompt, max_tokens=180)
+        return normalize_budget_create(parsed, default_currency=self.default_currency)
 
     async def answer_smalltalk(self, user_text: str) -> str:
         prompt = f"""
@@ -595,7 +697,6 @@ class ClaudeParser:
 - якщо даних мало, чесно так і скажи
 - давай конкретні висновки і 2-4 практичні рекомендації
 - не будь занадто багатослівним
-- якщо бачиш явні великі категорії витрат, звертай на них увагу
 
 Питання користувача:
 {user_text}
