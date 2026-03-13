@@ -85,13 +85,11 @@ def normalize_balance_setup(parsed: Dict[str, Any], default_currency: str) -> Di
         balance = normalize_amount(item.get("balance"))
         currency = normalize_text(item.get("currency"), default_currency).upper()
 
-        normalized_accounts.append(
-            {
-                "name": name,
-                "balance": balance,
-                "currency": currency,
-            }
-        )
+        normalized_accounts.append({
+            "name": name,
+            "balance": balance,
+            "currency": currency,
+        })
 
     if not normalized_accounts:
         raise ValueError("Після нормалізації список accounts порожній")
@@ -102,47 +100,20 @@ def normalize_balance_setup(parsed: Dict[str, Any], default_currency: str) -> Di
     }
 
 
-def normalize_last_transaction_action(parsed: Dict[str, Any], default_currency: str) -> Dict[str, Any]:
+def normalize_intent(parsed: Dict[str, Any]) -> str:
     intent = normalize_text(parsed.get("intent"), "").lower()
-    if intent != "last_transaction_action":
-        raise ValueError(f"Непідтримуваний intent: {intent}")
 
-    action = normalize_text(parsed.get("action"), "").lower()
-    if action not in {"delete", "update"}:
-        raise ValueError(f"Непідтримуваний action: {action}")
-
-    amount = parsed.get("amount")
-    if amount is not None:
-        amount = normalize_amount(amount)
-
-    category = parsed.get("category")
-    if category is not None:
-        category = normalize_text(category, "")
-
-    description = parsed.get("description")
-    if description is not None:
-        description = normalize_text(description, "")
-
-    source_account = parsed.get("source_account")
-    if source_account is not None:
-        source_account = normalize_text(source_account, "")
-
-    destination_account = parsed.get("destination_account")
-    if destination_account is not None:
-        destination_account = normalize_text(destination_account, "")
-
-    currency = normalize_text(parsed.get("currency"), default_currency).upper()
-
-    return {
-        "intent": "last_transaction_action",
-        "action": action,
-        "amount": amount,
-        "currency": currency,
-        "category": category,
-        "description": description,
-        "source_account": source_account,
-        "destination_account": destination_account,
+    allowed = {
+        "finance_write",
+        "finance_query",
+        "finance_advice",
+        "smalltalk",
     }
+
+    if intent not in allowed:
+        raise ValueError(f"Непідтримуваний intent router result: {intent}")
+
+    return intent
 
 
 class ClaudeParser:
@@ -170,25 +141,7 @@ class ClaudeParser:
 
         return any(trigger in low for trigger in triggers)
 
-    def looks_like_last_transaction_action_request(self, text: str) -> bool:
-        low = text.strip().lower()
-
-        if low.startswith("не з ") or low.startswith("не на "):
-            return True
-
-        triggers = [
-            "видали остан",
-            "зміни остан",
-            "останню транзакц",
-            "останню витрат",
-            "останній дохід",
-            "останній переказ",
-            "останньої транзакц",
-        ]
-
-        return any(trigger in low for trigger in triggers)
-
-    async def _call_claude(self, prompt: str) -> Dict[str, Any]:
+    async def _call_claude_json(self, prompt: str, max_tokens: int = 350) -> Dict[str, Any]:
         import httpx
 
         headers = {
@@ -199,7 +152,7 @@ class ClaudeParser:
 
         payload = {
             "model": self.model,
-            "max_tokens": 350,
+            "max_tokens": max_tokens,
             "temperature": 0,
             "messages": [
                 {"role": "user", "content": prompt}
@@ -230,6 +183,82 @@ class ClaudeParser:
             return json.loads(raw_text)
         except json.JSONDecodeError as e:
             raise ValueError(f"Claude повернув не JSON: {raw_text}") from e
+
+    async def _call_claude_text(self, prompt: str, max_tokens: int = 500) -> str:
+        import httpx
+
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+
+        payload = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "temperature": 0.3,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+        }
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(self.api_url, headers=headers, json=payload)
+
+            if response.status_code >= 400:
+                raise Exception(f"Claude {response.status_code}: {response.text}")
+
+            data = response.json()
+
+        content_blocks = data.get("content", [])
+        if not content_blocks:
+            raise ValueError("Claude повернув порожню відповідь")
+
+        text_parts: List[str] = []
+        for block in content_blocks:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+
+        return "\n".join(text_parts).strip()
+
+    async def parse_intent_text(self, user_text: str) -> str:
+        prompt = f"""
+Ти роутер намірів для фінансового Telegram-бота.
+Поверни СУВОРО лише JSON без markdown.
+
+Формат:
+{{
+  "intent": "finance_write" | "finance_query" | "finance_advice" | "smalltalk"
+}}
+
+Пояснення категорій:
+- finance_write: користувач хоче ЗАПИСАТИ нову фінансову дію. Приклади: "кава 200", "зарплата 30000", "АТБ 540"
+- finance_query: користувач хоче отримати цифри/звіт/статистику. Приклади: "скільки я витратив за тиждень", "топ категорії"
+- finance_advice: користувач хоче аналіз, висновки, поради, рекомендації. Приклади: "на що мені зменшити витрати", "що в мене не так по витратах"
+- smalltalk: звичайна розмова, не фінансова дія і не звіт. Приклади: "як справи", "шо нового", "ти тут?"
+
+Приклади:
+Вхід: як справи
+Вихід:
+{{"intent": "smalltalk"}}
+
+Вхід: кава 200
+Вихід:
+{{"intent": "finance_write"}}
+
+Вхід: скільки я витратив за місяць
+Вихід:
+{{"intent": "finance_query"}}
+
+Вхід: на що я б міг зменшити витрати
+Вихід:
+{{"intent": "finance_advice"}}
+
+Повідомлення:
+{user_text}
+"""
+        parsed = await self._call_claude_json(prompt, max_tokens=80)
+        return normalize_intent(parsed)
 
     async def parse_transaction_text(self, user_text: str) -> Dict[str, Any]:
         prompt = f"""
@@ -283,7 +312,7 @@ class ClaudeParser:
 Повідомлення:
 {user_text}
 """
-        parsed = await self._call_claude(prompt)
+        parsed = await self._call_claude_json(prompt)
         normalized = normalize_parsed(
             parsed,
             default_currency=self.default_currency,
@@ -358,104 +387,42 @@ class ClaudeParser:
 Повідомлення:
 {user_text}
 """
-        parsed = await self._call_claude(prompt)
+        parsed = await self._call_claude_json(prompt)
         normalized = normalize_balance_setup(
             parsed,
             default_currency=self.default_currency,
         )
         return normalized
 
-    async def parse_last_transaction_action_text(self, user_text: str, account_names: List[str]) -> Dict[str, Any]:
-        accounts_text = "\n".join(f"- {name}" for name in account_names)
-
+    async def answer_smalltalk(self, user_text: str) -> str:
         prompt = f"""
-Ти парсер команд для редагування або видалення ОСТАННЬОЇ транзакції.
-Поверни СУВОРО лише JSON без markdown, без пояснень, без трійних лапок.
+Ти Telegram-бот з фінансовим ухилом.
+Відповідай коротко, природно, українською.
+Не вигадуй фінансові дані, якщо тебе про них не питали.
+Не намагайся записувати транзакцію.
 
-Доступні asset-рахунки:
-{accounts_text}
-
-Формат:
-{{
-  "intent": "last_transaction_action",
-  "action": "delete" | "update",
-  "amount": number | null,
-  "currency": "{self.default_currency}",
-  "category": "рядок" | null,
-  "description": "рядок" | null,
-  "source_account": "точна назва зі списку" | null,
-  "destination_account": "точна назва зі списку" | null
-}}
-
-Правила:
-- якщо користувач хоче видалити останню транзакцію, став action = "delete"
-- якщо користувач хоче змінити щось в останній транзакції, став action = "update"
-- якщо поле не треба змінювати, повертай null
-- source_account і destination_account можна повертати тільки зі списку вище
-- враховуй опечатки, скорочення, цифри в назвах рахунків
-- amount має бути числом або null
-- currency за замовчуванням "{self.default_currency}"
-
-Приклади:
-
-Вхід: видали останню транзакцію
-Вихід:
-{{
-  "intent": "last_transaction_action",
-  "action": "delete",
-  "amount": null,
-  "currency": "{self.default_currency}",
-  "category": null,
-  "description": null,
-  "source_account": null,
-  "destination_account": null
-}}
-
-Вхід: зміни останню витрату з 200 на 250
-Вихід:
-{{
-  "intent": "last_transaction_action",
-  "action": "update",
-  "amount": 250,
-  "currency": "{self.default_currency}",
-  "category": null,
-  "description": null,
-  "source_account": null,
-  "destination_account": null
-}}
-
-Вхід: зміни категорію останньої транзакції на Пальне
-Вихід:
-{{
-  "intent": "last_transaction_action",
-  "action": "update",
-  "amount": null,
-  "currency": "{self.default_currency}",
-  "category": "Пальне",
-  "description": null,
-  "source_account": null,
-  "destination_account": null
-}}
-
-Вхід: не з готівки, а з Приватбанк 7097
-Вихід:
-{{
-  "intent": "last_transaction_action",
-  "action": "update",
-  "amount": null,
-  "currency": "{self.default_currency}",
-  "category": null,
-  "description": null,
-  "source_account": "Приватбанк 7097",
-  "destination_account": null
-}}
-
-Повідомлення:
+Повідомлення користувача:
 {user_text}
 """
-        parsed = await self._call_claude(prompt)
-        normalized = normalize_last_transaction_action(
-            parsed,
-            default_currency=self.default_currency,
-        )
-        return normalized
+        return await self._call_claude_text(prompt, max_tokens=120)
+
+    async def answer_finance_advice(self, user_text: str, context_json: str) -> str:
+        prompt = f"""
+Ти фінансовий помічник користувача.
+Тобі дано зведений фінансовий контекст у JSON.
+На основі нього дай коротку, практичну відповідь українською.
+
+Правила:
+- не вигадуй дані поза контекстом
+- якщо даних мало, чесно так і скажи
+- давай конкретні висновки і 2-4 практичні рекомендації
+- не будь занадто багатослівним
+- якщо бачиш явні великі категорії витрат, звертай на них увагу
+
+Питання користувача:
+{user_text}
+
+Контекст:
+{context_json}
+"""
+        return await self._call_claude_text(prompt, max_tokens=500)

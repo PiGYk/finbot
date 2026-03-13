@@ -4,6 +4,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 
+from app.services.advisor import AdvisorService
 from app.services.claude_parser import ClaudeParser
 from app.services.firefly_client import FireflyClient
 from app.services.reports import ReportService
@@ -82,6 +83,12 @@ reports = ReportService(
     default_currency=DEFAULT_CURRENCY,
 )
 
+advisor = AdvisorService(
+    firefly=firefly,
+    claude=claude,
+    default_currency=DEFAULT_CURRENCY,
+)
+
 
 async def send_telegram_message(chat_id: int, text: str) -> None:
     async with httpx.AsyncClient(timeout=30) as client:
@@ -122,45 +129,6 @@ def format_balance_setup_result(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def format_last_transaction_action_result(result: dict) -> str:
-    action = result.get("action")
-    currency = result.get("currency", DEFAULT_CURRENCY)
-
-    if action == "deleted":
-        return (
-            f"Видалив останню транзакцію:\n"
-            f"• Тип: {result.get('old_type')}\n"
-            f"• Сума: {result.get('old_amount', 0):.2f} {currency}\n"
-            f"• Опис: {result.get('old_description')}"
-        )
-
-    if action == "updated":
-        lines = [
-            "Оновив останню транзакцію:",
-            f"• Було: {result.get('old_amount', 0):.2f} {currency} | {result.get('old_description')}",
-            f"• Стало: {result.get('new_amount', 0):.2f} {currency} | {result.get('new_description')}",
-        ]
-
-        if result.get("old_source_account") != result.get("new_source_account"):
-            lines.append(
-                f"• Рахунок: {result.get('old_source_account')} → {result.get('new_source_account')}"
-            )
-
-        if result.get("old_destination_account") != result.get("new_destination_account"):
-            lines.append(
-                f"• Призначення: {result.get('old_destination_account')} → {result.get('new_destination_account')}"
-            )
-
-        if result.get("old_category") != result.get("new_category"):
-            lines.append(
-                f"• Категорія: {result.get('old_category')} → {result.get('new_category')}"
-            )
-
-        return "\n".join(lines)
-
-    return "Невідомий результат дії над останньою транзакцією."
-
-
 @app.get("/health")
 async def health() -> dict:
     return {
@@ -188,7 +156,6 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
     if not chat_id:
         return {"ok": True}
 
-    # Whitelist перевіряємо до Claude / Firefly
     if not is_chat_allowed(chat_id):
         await send_telegram_message(
             chat_id,
@@ -203,7 +170,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
     if not text:
         await send_telegram_message(
             chat_id,
-            "Поки що я обробляю тільки текстові повідомлення. Чеки, скріни і голосові зробимо наступним етапом."
+            "Поки що я обробляю тільки текстові повідомлення."
         )
         return {"ok": True}
 
@@ -214,22 +181,30 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             await send_telegram_message(chat_id, format_balance_setup_result(results))
             return {"ok": True}
 
-        if claude.looks_like_last_transaction_action_request(text):
-            account_names = await firefly.list_asset_account_names()
-            action_spec = await claude.parse_last_transaction_action_text(text, account_names)
-            result = await firefly.apply_last_transaction_action(
-                action_spec=action_spec,
-                default_currency=DEFAULT_CURRENCY,
-                default_source_account=DEFAULT_SOURCE_ACCOUNT,
-            )
-            await send_telegram_message(chat_id, format_last_transaction_action_result(result))
+        intent = await claude.parse_intent_text(text)
+
+        if intent == "smalltalk":
+            reply = await claude.answer_smalltalk(text)
+            await send_telegram_message(chat_id, reply)
             return {"ok": True}
 
-        report_reply = await reports.handle_report_request(text)
-        if report_reply:
-            await send_telegram_message(chat_id, report_reply)
+        if intent == "finance_query":
+            report_reply = await reports.handle_report_request(text)
+            if report_reply:
+                await send_telegram_message(chat_id, report_reply)
+                return {"ok": True}
+
+            # Якщо це не стандартний query зі звітів, пробуємо розумну відповідь через advisor.
+            advice_reply = await advisor.answer_question(text)
+            await send_telegram_message(chat_id, advice_reply)
             return {"ok": True}
 
+        if intent == "finance_advice":
+            advice_reply = await advisor.answer_question(text)
+            await send_telegram_message(chat_id, advice_reply)
+            return {"ok": True}
+
+        # За замовчуванням finance_write
         parsed = await claude.parse_transaction_text(text)
         await firefly.create_transaction(parsed)
 
