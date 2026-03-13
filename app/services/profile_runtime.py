@@ -84,6 +84,7 @@ class ProfileRuntimeFactory:
         category_rules = CategoryRulesService(
             file_path=f"{self.data_root}/category_rules_{profile_id}.json"
         )
+        category_rules.ensure_seeded()
 
         receipt_parser = ReceiptParser(
             api_key=self.claude_api_key,

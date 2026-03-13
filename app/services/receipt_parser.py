@@ -26,22 +26,16 @@ def normalize_text(value: Any, fallback: str) -> str:
 def normalize_amount(value: Any) -> float:
     if value is None:
         return 0.0
-
     if isinstance(value, (int, float)):
         amount = float(value)
     else:
         raw = str(value).strip()
-        raw = raw.replace("₴", "")
-        raw = raw.replace("грн", "")
-        raw = raw.replace("uah", "")
-        raw = raw.replace("UAH", "")
-        raw = raw.replace(",", ".")
-        raw = raw.replace(" ", "")
+        raw = raw.replace("₴", "").replace("грн", "").replace("uah", "").replace("UAH", "")
+        raw = raw.replace(",", ".").replace(" ", "")
         try:
             amount = float(raw)
         except ValueError:
             return 0.0
-
     return round(abs(amount), 2)
 
 
@@ -52,262 +46,6 @@ def normalize_receipt_date(value: Any) -> Optional[str]:
     if re.match(r"^\d{4}-\d{2}-\d{2}$", text):
         return text
     return None
-
-
-def keyword_category_from_name(name: str) -> Optional[str]:
-    low = name.lower().strip()
-
-    high_priority_patterns = [
-        (
-            "Цигарки",
-            [
-                "heets",
-                "terea",
-                "neo",
-                "veo",
-                "iqos",
-                "стік",
-                "стіки",
-                "стик",
-                "стики",
-                "сигар",
-                "цигар",
-                "тютюн",
-                "табак",
-                "tven",
-                "твен",
-                "tobacco",
-            ],
-        ),
-        (
-            "Пальне",
-            [
-                "a95",
-                "a-95",
-                "a92",
-                "a-92",
-                "diesel",
-                "дизель",
-                "дп",
-                "lpg",
-                "бензин",
-                "пальне",
-                "fuel",
-                "евро95",
-                "euro95",
-                "upg95",
-                "95 energy",
-                "95 pulls",
-                "заправка",
-            ],
-        ),
-        (
-            "Алкоголь",
-            [
-                "пиво",
-                "beer",
-                "вино",
-                "wine",
-                "горіл",
-                "водка",
-                "whisky",
-                "віскі",
-                "ром",
-                "gin",
-                "джин",
-            ],
-        ),
-        (
-            "Напої",
-            [
-                "cola",
-                "coca",
-                "pepsi",
-                "sprite",
-                "fanta",
-                "вода",
-                "сік",
-                "juice",
-                "чай",
-                "кава",
-                "напій",
-            ],
-        ),
-        (
-            "Гігієна",
-            [
-                "шампун",
-                "гель",
-                "soap",
-                "мило",
-                "паста",
-                "toothpaste",
-                "щітк",
-                "deodor",
-                "дезодо",
-                "сервет",
-            ],
-        ),
-        (
-            "Побутова хімія",
-            [
-                "порошок",
-                "fairy",
-                "мий",
-                "clean",
-                "доместос",
-                "білизн",
-                "праль",
-                "хлор",
-                "хім",
-            ],
-        ),
-        (
-            "Косметика",
-            [
-                "крем",
-                "mascara",
-                "туш",
-                "помада",
-                "lipstick",
-                "cosmetic",
-                "космет",
-            ],
-        ),
-        (
-            "Аптека",
-            [
-                "таблет",
-                "ліки",
-                "каплі",
-                "ibuprofen",
-                "парацет",
-                "цитрамон",
-                "аптека",
-            ],
-        ),
-        (
-            "Тварини",
-            [
-                "корм",
-                "cat",
-                "dog",
-                "кішк",
-                "собак",
-                "pet",
-            ],
-        ),
-        (
-            "Товари для дому",
-            [
-                "лампа",
-                "батарей",
-                "рушник",
-                "пакет",
-                "контейнер",
-                "губка",
-                "свічк",
-                "house",
-            ],
-        ),
-        (
-            "Продукти",
-            [
-                "хліб",
-                "булка",
-                "сир",
-                "молоко",
-                "кефір",
-                "масло",
-                "м'яс",
-                "ковбас",
-                "канапка",
-                "сендвіч",
-                "яйц",
-                "макарон",
-                "греч",
-                "рис",
-                "цукер",
-                "печиво",
-                "йогур",
-                "сметан",
-                "борщ",
-                "курка",
-            ],
-        ),
-    ]
-
-    for category, patterns in high_priority_patterns:
-        for pattern in patterns:
-            if pattern in low:
-                return category
-
-    return None
-
-
-def normalize_category(claude_category: Any, item_name: str) -> str:
-    name_hit = keyword_category_from_name(item_name)
-    if name_hit in {"Цигарки", "Пальне"}:
-        return name_hit
-
-    raw = normalize_text(claude_category, "Інше")
-    low = raw.lower()
-
-    mapping = {
-        "продукти": "Продукти",
-        "їжа": "Продукти",
-        "food": "Продукти",
-        "напої": "Напої",
-        "вода": "Напої",
-        "соки": "Напої",
-        "сигарки": "Цигарки",
-        "цигарки": "Цигарки",
-        "сигареты": "Цигарки",
-        "тютюн": "Цигарки",
-        "алкоголь": "Алкоголь",
-        "гігієна": "Гігієна",
-        "шампунь": "Гігієна",
-        "побутова хімія": "Побутова хімія",
-        "хімія": "Побутова хімія",
-        "косметика": "Косметика",
-        "аптека": "Аптека",
-        "ліки": "Аптека",
-        "товари для дому": "Товари для дому",
-        "дім": "Товари для дому",
-        "тварини": "Тварини",
-        "корм": "Тварини",
-        "пальне": "Пальне",
-        "бензин": "Пальне",
-        "дизель": "Пальне",
-        "дп": "Пальне",
-        "газ": "Пальне",
-        "lpg": "Пальне",
-        "fuel": "Пальне",
-        "diesel": "Пальне",
-        "a95": "Пальне",
-        "a-95": "Пальне",
-        "a92": "Пальне",
-        "a-92": "Пальне",
-        "заправка": "Пальне",
-        "інше": "Інше",
-    }
-
-    if low in mapping:
-        mapped = mapping[low]
-        if mapped == "Інше" and name_hit:
-            return name_hit
-        return mapped
-
-    for key, mapped_value in mapping.items():
-        if key in low:
-            if mapped_value == "Інше" and name_hit:
-                return name_hit
-            return mapped_value
-
-    if name_hit:
-        return name_hit
-
-    return raw[:1].upper() + raw[1:] if raw else "Інше"
 
 
 class ReceiptParser:
@@ -323,6 +61,8 @@ class ReceiptParser:
         self.default_currency = default_currency
         self.api_url = "https://api.anthropic.com/v1/messages"
         self.category_rules = category_rules
+        if self.category_rules is not None:
+            self.category_rules.ensure_seeded()
 
     def _aggregate_category_totals(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         bucket: Dict[str, float] = {}
@@ -332,11 +72,30 @@ class ReceiptParser:
             if amount <= 0:
                 continue
             bucket[category] = round(bucket.get(category, 0.0) + amount, 2)
-
         return [
             {"category": category, "amount": amount}
             for category, amount in sorted(bucket.items(), key=lambda x: x[1], reverse=True)
         ]
+
+    def _fallback_category(self, merchant: str, name: str, raw_category: Any) -> str:
+        text = f"{merchant} {name} {normalize_text(raw_category, '')}".lower()
+        checks = [
+            ("Цигарки", ["heets", "terea", "iqos", "сигар", "цигар", "тютюн", "вейп", "стік"]),
+            ("Пальне", ["a95", "a-95", "a92", "a-92", "дизель", "бензин", "lpg", "пальне", "fuel"]),
+            ("Вода", ["моршинська", "borjomi", "bonaqua", "мінеральна вода", "вода"]),
+            ("Солодкі напої", ["cola", "coca", "pepsi", "sprite", "fanta", "живчик", "burn", "red bull", "monster", "сік", "енергетик"]),
+            ("Алкоголь", ["пиво", "вино", "віскі", "горіл", "whisky", "gin", "ром"]),
+            ("Фастфуд і снеки", ["бургер", "хот дог", "шаурма", "пельмені", "чіпси", "шоколад", "печиво", "насіння", "сендвіч", "ковбас", "сосиски"]),
+            ("Аптека", ["ліки", "таблет", "мазь", "сироп", "аптека", "ibuprofen", "парацетамол"]),
+            ("Тварини", ["корм", "pet", "кішк", "собак", "вет"]),
+            ("Гігієна та догляд", ["шампун", "гель", "мило", "паста", "крем", "туалетний папір", "прокладки"]),
+            ("Побутова хімія", ["fairy", "доместос", "порошок", "миття посуду", "засіб для прибирання"]),
+            ("Товари для дому", ["рушник", "посуд", "лампочка", "контейнер", "органайзер"]),
+        ]
+        for category, patterns in checks:
+            if any(pattern in text for pattern in patterns):
+                return category
+        return "Інше"
 
     def _normalize_receipt(self, parsed: Dict[str, Any]) -> Dict[str, Any]:
         merchant = normalize_text(parsed.get("merchant"), "Чек")
@@ -352,31 +111,26 @@ class ReceiptParser:
         for raw in raw_items:
             if not isinstance(raw, dict):
                 continue
-
             name = normalize_text(raw.get("name"), "Товар")
             total_price = normalize_amount(raw.get("total_price"))
-
-            custom_category = None
-            if self.category_rules is not None:
-                custom_category = self.category_rules.resolve_category(name, fallback=None)
-
-            if custom_category:
-                category = custom_category
-            else:
-                category = normalize_category(raw.get("category"), name)
-                if self.category_rules is not None:
-                    category = self.category_rules.resolve_category(f"{name} {category}", fallback=category)
-
             if total_price <= 0:
                 continue
 
-            items.append(
-                {
-                    "name": name,
-                    "total_price": total_price,
-                    "category": category,
-                }
-            )
+            if self.category_rules is not None:
+                category = self.category_rules.resolve_receipt_category(
+                    item_name=name,
+                    model_category=raw.get("category"),
+                    merchant=merchant,
+                    fallback="Інше",
+                )
+            else:
+                category = self._fallback_category(merchant, name, raw.get("category"))
+
+            items.append({
+                "name": name,
+                "total_price": total_price,
+                "category": category,
+            })
 
         if not items:
             raise ValueError("У чеку не знайдено валідних позицій")
@@ -394,62 +148,62 @@ class ReceiptParser:
             "receipt_total": receipt_total,
         }
 
-    async def parse_receipt_image(self, image_bytes: bytes, media_type: str) -> Dict[str, Any]:
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-
-        prompt = f"""
+    def _build_prompt(self) -> str:
+        category_guide = (
+            self.category_rules.render_receipt_category_guide()
+            if self.category_rules is not None
+            else "- Інше: якщо нічого не підійшло."
+        )
+        return f"""
 Ти парсер касових чеків українською.
 Потрібно розібрати ФОТО ЧЕКА і повернути СУВОРО лише JSON без markdown, без пояснень, без трійних лапок.
 
 Поверни формат:
 {{
-  "merchant": "назва магазину або супермаркету",
+  "merchant": "назва магазину або закладу",
   "receipt_date": "YYYY-MM-DD" або null,
   "currency": "{self.default_currency}",
   "items": [
     {{
       "name": "назва позиції",
       "total_price": number,
-      "category": "одна з категорій"
+      "category": "одна з дозволених категорій"
     }}
   ]
 }}
 
-Категорії використовуй тільки з цього списку:
-- Продукти
-- Напої
-- Цигарки
-- Пальне
-- Алкоголь
-- Гігієна
-- Побутова хімія
-- Косметика
-- Аптека
-- Товари для дому
-- Тварини
-- Інше
+Категорії використовуй ТІЛЬКИ з цього списку:
+{category_guide}
 
-Правила:
-- total_price це ПОВНА СУМА ПО РЯДКУ, не ціна за штуку
-- якщо є кількість, все одно повертай уже готовий total_price по позиції
-- якщо позиція нерозбірлива, але видно суму, можеш лишити коротку назву і категорію Інше
-- merchant спробуй знайти максимально точно
-- receipt_date поверни у форматі YYYY-MM-DD, якщо не впевнений — null
-- currency за замовчуванням {self.default_currency}
-- поверни всі видимі позиції з чека, а не тільки загальну суму
-- усе, що схоже на HEETS, TEREA, IQOS, стіки, сигарети, тютюн — віднось до категорії Цигарки
-- усе, що схоже на бензин, дизель, A95, A92, LPG, газ — віднось до категорії Пальне
-"""
+Жорсткі правила:
+- НЕ вигадуй нових категорій.
+- total_price це повна сума по рядку, не ціна за штуку.
+- якщо позиція нерозбірлива, але видно суму, залиш коротку назву і категорію Інше.
+- merchant спробуй знайти максимально точно.
+- receipt_date поверни у форматі YYYY-MM-DD, якщо не впевнений — null.
+- currency за замовчуванням {self.default_currency}.
+- поверни всі видимі позиції з чека, а не тільки загальну суму.
+- базові продукти для дому класифікуй як Продукти.
+- вода без цукру класифікуй як Вода.
+- cola, pepsi, sprite, живчик, соки, холодні чаї, енергетики класифікуй як Солодкі напої.
+- хот-доги, бургери, шаурма, ковбаса, сосиски, пельмені, чіпси, шоколад, насіння, солодощі, напівфабрикати класифікуй як Фастфуд і снеки.
+- чеки із кафе, ресторанів, пабів і кав'ярень та готові напої в закладах класифікуй як Кафе та ресторани.
+- HEETS, TEREA, IQOS, стіки, сигарети, тютюн, вейпи класифікуй як Цигарки.
+- бензин, дизель, A95, A92, LPG, газ класифікуй як Пальне.
+- якщо чек змішаний, класифікуй КОЖНУ позицію окремо.
+""".strip()
 
+    async def parse_receipt_image(self, image_bytes: bytes, media_type: str) -> Dict[str, Any]:
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        prompt = self._build_prompt()
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
-
         payload = {
             "model": self.model,
-            "max_tokens": 1200,
+            "max_tokens": 1800,
             "temperature": 0,
             "messages": [
                 {
@@ -468,13 +222,10 @@ class ReceiptParser:
                 }
             ],
         }
-
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(self.api_url, headers=headers, json=payload)
-
             if response.status_code >= 400:
                 raise Exception(f"Claude {response.status_code}: {response.text}")
-
             data = response.json()
 
         content_blocks = data.get("content", [])
@@ -486,9 +237,7 @@ class ReceiptParser:
             if isinstance(block, dict) and block.get("type") == "text":
                 text_parts.append(block.get("text", ""))
 
-        raw_text = "\n".join(text_parts).strip()
-        raw_text = strip_code_fences(raw_text)
-
+        raw_text = strip_code_fences("\n".join(text_parts).strip())
         try:
             parsed = json.loads(raw_text)
         except json.JSONDecodeError as e:
