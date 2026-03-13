@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from app.services.category_rules import CategoryRulesService
+
 
 def strip_code_fences(text: str) -> str:
     text = text.strip()
@@ -244,8 +246,6 @@ def keyword_category_from_name(name: str) -> Optional[str]:
 
 
 def normalize_category(claude_category: Any, item_name: str) -> str:
-    # Спочатку дивимось на назву товару.
-    # Для цигарок і пального це має вищий пріоритет, ніж категорія від Claude.
     name_hit = keyword_category_from_name(item_name)
     if name_hit in {"Цигарки", "Пальне"}:
         return name_hit
@@ -311,11 +311,18 @@ def normalize_category(claude_category: Any, item_name: str) -> str:
 
 
 class ReceiptParser:
-    def __init__(self, api_key: str, model: str, default_currency: str) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        default_currency: str,
+        category_rules: Optional[CategoryRulesService] = None,
+    ) -> None:
         self.api_key = api_key
         self.model = model
         self.default_currency = default_currency
         self.api_url = "https://api.anthropic.com/v1/messages"
+        self.category_rules = category_rules
 
     def _aggregate_category_totals(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         bucket: Dict[str, float] = {}
@@ -348,7 +355,17 @@ class ReceiptParser:
 
             name = normalize_text(raw.get("name"), "Товар")
             total_price = normalize_amount(raw.get("total_price"))
-            category = normalize_category(raw.get("category"), name)
+
+            custom_category = None
+            if self.category_rules is not None:
+                custom_category = self.category_rules.resolve_category(name, fallback=None)
+
+            if custom_category:
+                category = custom_category
+            else:
+                category = normalize_category(raw.get("category"), name)
+                if self.category_rules is not None:
+                    category = self.category_rules.resolve_category(f"{name} {category}", fallback=category)
 
             if total_price <= 0:
                 continue

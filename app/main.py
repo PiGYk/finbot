@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 
 from app.services.advisor import AdvisorService
+from app.services.category_rules import CategoryRulesService
 from app.services.claude_parser import ClaudeParser
 from app.services.firefly_client import FireflyClient
 from app.services.pending_store import PendingStore
@@ -28,6 +29,7 @@ DEFAULT_SOURCE_ACCOUNT = os.getenv("DEFAULT_SOURCE_ACCOUNT", "Готівка").s
 DEFAULT_CURRENCY = os.getenv("DEFAULT_CURRENCY", "UAH").strip()
 
 ALLOWED_CHAT_IDS_RAW = os.getenv("ALLOWED_CHAT_IDS", "").strip()
+CATEGORY_RULES_FILE = os.getenv("CATEGORY_RULES_FILE", "/app/data/category_rules.json").strip()
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
@@ -92,10 +94,13 @@ advisor = AdvisorService(
     default_currency=DEFAULT_CURRENCY,
 )
 
+category_rules = CategoryRulesService(file_path=CATEGORY_RULES_FILE)
+
 receipt_parser = ReceiptParser(
     api_key=CLAUDE_API_KEY,
     model=CLAUDE_MODEL,
     default_currency=DEFAULT_CURRENCY,
+    category_rules=category_rules,
 )
 
 pending_store = PendingStore()
@@ -137,6 +142,10 @@ async def get_telegram_file_bytes(file_id: str) -> tuple[bytes, str]:
         media_type = "image/jpeg"
 
     return download_response.content, media_type
+
+
+def canonicalize_category(text: str) -> str:
+    return category_rules.resolve_category(text, fallback=text) or text
 
 
 def format_balance_setup_result(results: list[dict]) -> str:
@@ -296,6 +305,7 @@ async def health() -> dict:
         "ok": True,
         "whitelist_enabled": bool(ALLOWED_CHAT_IDS),
         "allowed_chat_ids_count": len(ALLOWED_CHAT_IDS),
+        "category_rules_count": len(category_rules.list_rules()),
     }
 
 
@@ -370,16 +380,26 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             return {"ok": True}
 
         if not text:
-            await send_telegram_message(
-                chat_id,
-                "Поки що я обробляю текстові повідомлення і фото чеків."
-            )
+            await send_telegram_message(chat_id, "Поки що я обробляю текстові повідомлення і фото чеків.")
             return {"ok": True}
 
         if claude.looks_like_balance_setup_request(text):
             parsed_setup = await claude.parse_balance_setup_text(text)
             results = await firefly.setup_balances(parsed_setup["accounts"])
             await send_telegram_message(chat_id, format_balance_setup_result(results))
+            return {"ok": True}
+
+        if claude.looks_like_category_create_request(text):
+            parsed_category = await claude.parse_category_create_text(text)
+            canonical_name = parsed_category["canonical_name"]
+
+            await firefly.ensure_category(canonical_name)
+            rule = category_rules.upsert_rule(
+                canonical_name=canonical_name,
+                aliases=parsed_category["aliases"],
+            )
+
+            await send_telegram_message(chat_id, category_rules.format_rule_result(rule))
             return {"ok": True}
 
         if claude.looks_like_transfer_request(text):
@@ -392,6 +412,10 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
         if claude.looks_like_last_transaction_action_request(text):
             account_names = await firefly.list_asset_account_names()
             action_spec = await claude.parse_last_transaction_action_text(text, account_names)
+
+            if action_spec.get("category"):
+                action_spec["category"] = canonicalize_category(action_spec["category"])
+
             result = await firefly.apply_last_transaction_action(
                 action_spec=action_spec,
                 default_currency=DEFAULT_CURRENCY,
@@ -423,6 +447,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             return {"ok": True}
 
         parsed = await claude.parse_transaction_text(text)
+        parsed["category"] = canonicalize_category(f"{parsed['description']} {parsed['category']}")
         await firefly.create_transaction(parsed)
 
         await send_telegram_message(

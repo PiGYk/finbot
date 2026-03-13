@@ -1,6 +1,6 @@
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 def strip_code_fences(text: str) -> str:
@@ -191,6 +191,34 @@ def normalize_last_transaction_action(parsed: Dict[str, Any], default_currency: 
     }
 
 
+def normalize_category_create(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    intent = normalize_text(parsed.get("intent"), "").lower()
+    if intent != "create_category":
+        raise ValueError(f"Непідтримуваний intent: {intent}")
+
+    canonical_name = normalize_text(parsed.get("canonical_name"), "")
+    if not canonical_name:
+        raise ValueError("Claude не визначив canonical_name для нової категорії")
+
+    raw_aliases = parsed.get("aliases")
+    aliases: List[str] = []
+
+    if isinstance(raw_aliases, list):
+        for item in raw_aliases:
+            alias = str(item or "").strip()
+            if alias:
+                aliases.append(alias)
+
+    if canonical_name not in aliases:
+        aliases.insert(0, canonical_name)
+
+    return {
+        "intent": "create_category",
+        "canonical_name": canonical_name,
+        "aliases": aliases,
+    }
+
+
 def normalize_intent(parsed: Dict[str, Any]) -> str:
     intent = normalize_text(parsed.get("intent"), "").lower()
 
@@ -217,7 +245,6 @@ class ClaudeParser:
 
     def looks_like_balance_setup_request(self, text: str) -> bool:
         low = text.strip().lower()
-
         triggers = [
             "початкові баланси",
             "початковий баланс",
@@ -229,7 +256,6 @@ class ClaudeParser:
             "зараз на рахунках",
             "залишки по рахунках",
         ]
-
         return any(trigger in low for trigger in triggers)
 
     def looks_like_transfer_request(self, text: str) -> bool:
@@ -270,6 +296,18 @@ class ClaudeParser:
 
         return any(trigger in low for trigger in triggers)
 
+    def looks_like_category_create_request(self, text: str) -> bool:
+        low = text.strip().lower()
+        return (
+            "категор" in low
+            and (
+                "додай нов" in low
+                or "створи нов" in low
+                or "додай категор" in low
+                or "створи категор" in low
+            )
+        )
+
     async def _call_claude_json(self, prompt: str, max_tokens: int = 350) -> Dict[str, Any]:
         import httpx
 
@@ -283,9 +321,7 @@ class ClaudeParser:
             "model": self.model,
             "max_tokens": max_tokens,
             "temperature": 0,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ],
+            "messages": [{"role": "user", "content": prompt}],
         }
 
         async with httpx.AsyncClient(timeout=60) as client:
@@ -326,9 +362,7 @@ class ClaudeParser:
             "model": self.model,
             "max_tokens": max_tokens,
             "temperature": 0.3,
-            "messages": [
-                {"role": "user", "content": prompt}
-            ],
+            "messages": [{"role": "user", "content": prompt}],
         }
 
         async with httpx.AsyncClient(timeout=60) as client:
@@ -437,10 +471,7 @@ class ClaudeParser:
 {user_text}
 """
         parsed = await self._call_claude_json(prompt)
-        return normalize_balance_setup(
-            parsed,
-            default_currency=self.default_currency,
-        )
+        return normalize_balance_setup(parsed, default_currency=self.default_currency)
 
     async def parse_transfer_text(self, user_text: str, account_names: List[str]) -> Dict[str, Any]:
         accounts_text = "\n".join(f"- {name}" for name in account_names)
@@ -498,90 +529,48 @@ class ClaudeParser:
   "target_description": "рядок" | null
 }}
 
-Пояснення:
-- action=delete: видалення всієї останньої транзакції або її частини
-- action=update: редагування всієї останньої транзакції або її частини
-- якщо користувач вказує частину чека або частину групової транзакції, поверни selector:
-  - target_index: номер частини, якщо сказано "1 частину", "другу частину" тощо
-  - target_category: якщо вказано категорію частини, наприклад "інше", "напої", "продукти"
-  - target_description: якщо вказано опис частини
-
-Правила:
-- якщо поле не треба змінювати, повертай null
-- source_account і destination_account мають бути тільки зі списку
-- враховуй опечатки, скорочення, цифри в назвах рахунків
-
-Приклади:
-
-Вхід: видали останню транзакцію
-Вихід:
-{{
-  "intent": "last_transaction_action",
-  "action": "delete",
-  "amount": null,
-  "currency": "{self.default_currency}",
-  "category": null,
-  "description": null,
-  "source_account": null,
-  "destination_account": null,
-  "target_index": null,
-  "target_category": null,
-  "target_description": null
-}}
-
-Вхід: зміни останню витрату з 200 на 250
-Вихід:
-{{
-  "intent": "last_transaction_action",
-  "action": "update",
-  "amount": 250,
-  "currency": "{self.default_currency}",
-  "category": null,
-  "description": null,
-  "source_account": null,
-  "destination_account": null,
-  "target_index": null,
-  "target_category": null,
-  "target_description": null
-}}
-
-Вхід: зміни останню витрату "інше" і додай її в цигарки
-Вихід:
-{{
-  "intent": "last_transaction_action",
-  "action": "update",
-  "amount": null,
-  "currency": "{self.default_currency}",
-  "category": "Цигарки",
-  "description": null,
-  "source_account": null,
-  "destination_account": null,
-  "target_index": null,
-  "target_category": "Інше",
-  "target_description": null
-}}
-
-Вхід: видали з останнього чеку напої
-Вихід:
-{{
-  "intent": "last_transaction_action",
-  "action": "delete",
-  "amount": null,
-  "currency": "{self.default_currency}",
-  "category": null,
-  "description": null,
-  "source_account": null,
-  "destination_account": null,
-  "target_index": null,
-  "target_category": "Напої",
-  "target_description": null
-}}
-
 Повідомлення:
 {user_text}
 """
         parsed = await self._call_claude_json(prompt, max_tokens=500)
         return normalize_last_transaction_action(parsed, default_currency=self.default_currency)
+
+    async def parse_category_create_text(self, user_text: str) -> Dict[str, Any]:
+        prompt = f"""
+Ти парсер команд на створення нової фінансової категорії.
+Поверни СУВОРО лише JSON без markdown, без пояснень, без трійних лапок.
+
+Формат:
+{{
+  "intent": "create_category",
+  "canonical_name": "канонічна назва категорії",
+  "aliases": ["аліас 1", "аліас 2", "аліас 3"]
+}}
+
+Правила:
+- canonical_name має бути людською, чистою, красивою назвою категорії
+- якщо це відомий бренд або товар, можна нормалізувати написання, наприклад:
+  - "кока кола" -> "Coca Cola"
+  - "ред бул" -> "Red Bull"
+  - "монстер" -> "Monster Energy"
+- aliases мають включати найпоширеніші варіанти написання, зокрема кирилицю, латиницю, дефіси, поширені помилки і скорочення
+- не вигадуй занадто довгий список, достатньо 5-12 розумних варіантів
+- aliases мають допомагати майбутньому розпізнаванню в тексті та на чеках
+
+Приклад:
+Вхід: додай нову категорію Кока кола
+Вихід:
+{{
+  "intent": "create_category",
+  "canonical_name": "Coca Cola",
+  "aliases": ["Coca Cola", "Coca-Cola", "coca cola", "cola", "кока кола", "кока-кола", "кокак кола"]
+}}
+
+Повідомлення:
+{user_text}
+"""
+        parsed = await self._call_claude_json(prompt, max_tokens=300)
+        return normalize_category_create(parsed)
 
     async def answer_smalltalk(self, user_text: str) -> str:
         prompt = f"""
