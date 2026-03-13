@@ -255,6 +255,120 @@ def normalize_reminder_create(parsed: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def normalize_reminder_manage(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    intent = normalize_text(parsed.get("intent"), "").lower()
+    if intent != "manage_reminder":
+        raise ValueError(f"Непідтримуваний intent: {intent}")
+
+    action = normalize_text(parsed.get("action"), "").lower()
+    if action not in {"list", "delete", "update", "disable", "enable"}:
+        raise ValueError(f"Непідтримуваний action для reminder: {action}")
+
+    target_index = normalize_optional_int(parsed.get("target_index"))
+    target_text = normalize_text(parsed.get("target_text"), "") or None
+    new_text = normalize_text(parsed.get("new_text"), "") or None
+
+    hour = parsed.get("hour")
+    minute = parsed.get("minute")
+    if hour not in (None, ""):
+        try:
+            hour = int(hour)
+        except (TypeError, ValueError):
+            raise ValueError("Некоректна година для нагадування")
+        if hour < 0 or hour > 23:
+            raise ValueError("Година нагадування має бути від 0 до 23")
+    else:
+        hour = None
+
+    if minute not in (None, ""):
+        try:
+            minute = int(minute)
+        except (TypeError, ValueError):
+            raise ValueError("Некоректні хвилини для нагадування")
+        if minute < 0 or minute > 59:
+            raise ValueError("Хвилини нагадування мають бути від 0 до 59")
+    else:
+        minute = None
+
+    return {
+        "intent": "manage_reminder",
+        "action": action,
+        "target_index": target_index,
+        "target_text": target_text,
+        "new_text": new_text,
+        "hour": hour,
+        "minute": minute,
+    }
+
+
+def normalize_subscription_manage(parsed: Dict[str, Any], default_currency: str) -> Dict[str, Any]:
+    intent = normalize_text(parsed.get("intent"), "").lower()
+    if intent != "manage_subscription":
+        raise ValueError(f"Непідтримуваний intent: {intent}")
+
+    action = normalize_text(parsed.get("action"), "").lower()
+    if action not in {"list", "delete", "update", "disable", "enable"}:
+        raise ValueError(f"Непідтримуваний action для subscription: {action}")
+
+    repeat_freq = normalize_text(parsed.get("repeat_freq"), "").lower()
+    if not repeat_freq:
+        if parsed.get("weekday") not in (None, ""):
+            repeat_freq = "weekly"
+        elif parsed.get("day_of_month") not in (None, ""):
+            repeat_freq = "monthly"
+        elif parsed.get("month") not in (None, "") or parsed.get("day") not in (None, ""):
+            repeat_freq = "yearly"
+    if repeat_freq and repeat_freq not in {"daily", "weekly", "monthly", "yearly"}:
+        raise ValueError(f"Непідтримуваний repeat_freq: {repeat_freq}")
+
+    amount = parsed.get("amount")
+    if amount not in (None, ""):
+        amount = normalize_amount(amount)
+    else:
+        amount = None
+
+    skip = parsed.get("skip")
+    if skip in (None, ""):
+        skip = None
+    else:
+        try:
+            skip = max(0, int(skip))
+        except (TypeError, ValueError):
+            skip = None
+
+    day_of_month = normalize_optional_int(parsed.get("day_of_month"))
+    weekday = normalize_optional_int(parsed.get("weekday"))
+    month = normalize_optional_int(parsed.get("month"))
+    day = normalize_optional_int(parsed.get("day"))
+
+    date_value = None
+    if repeat_freq:
+        date_value = resolve_subscription_date(
+            repeat_freq=repeat_freq,
+            raw_date=parsed.get("date"),
+            day_of_month=day_of_month,
+            weekday=weekday,
+            month=month,
+            day=day,
+        )
+    elif parsed.get("date"):
+        date_value = validate_iso_date(str(parsed.get("date")))
+
+    return {
+        "intent": "manage_subscription",
+        "action": action,
+        "target_name": normalize_text(parsed.get("target_name"), "") or None,
+        "target_id": normalize_text(parsed.get("target_id"), "") or None,
+        "name": normalize_text(parsed.get("name"), "") or None,
+        "amount": amount,
+        "currency": normalize_text(parsed.get("currency"), default_currency).upper(),
+        "repeat_freq": repeat_freq or None,
+        "date": date_value,
+        "skip": skip,
+        "notes": normalize_text(parsed.get("notes"), "") or None,
+    }
+
+
 def normalize_budget_create(parsed: Dict[str, Any], default_currency: str) -> Dict[str, Any]:
     intent = normalize_text(parsed.get("intent"), "").lower()
     if intent != "create_budget":
@@ -503,6 +617,11 @@ class ClaudeParser:
         low = text.strip().lower()
         return "нагад" in low and ("кожен день" in low or "щодня" in low or "щоденно" in low)
 
+    def looks_like_reminder_manage_request(self, text: str) -> bool:
+        low = text.strip().lower()
+        actions = ("покажи", "список", "мої", "видали", "скасуй", "зміни", "онови", "вимкни", "увімкни")
+        return "нагад" in low and any(action in low for action in actions) and not self.looks_like_reminder_request(text)
+
     def looks_like_budget_create_request(self, text: str) -> bool:
         low = text.strip().lower()
         return (
@@ -548,6 +667,18 @@ class ClaudeParser:
         has_amount_hint = any(ch.isdigit() for ch in low)
 
         return has_subscription_word and (has_create_word or (has_schedule_word and has_amount_hint))
+
+    def looks_like_subscription_manage_request(self, text: str) -> bool:
+        low = text.strip().lower()
+        actions = ("покажи", "список", "мої", "видали", "скасуй", "зміни", "онови", "вимкни", "увімкни")
+        has_subscription_word = (
+            "підписк" in low
+            or "регулярн" in low
+            or "автоспис" in low
+            or "регулярний плат" in low
+            or "регулярну оплат" in low
+        )
+        return has_subscription_word and any(action in low for action in actions) and not self.looks_like_subscription_create_request(text)
 
     async def _call_claude_json(self, prompt: str, max_tokens: int = 350) -> Dict[str, Any]:
         import httpx
@@ -820,6 +951,38 @@ class ClaudeParser:
         parsed = await self._call_claude_json(prompt, max_tokens=200)
         return normalize_reminder_create(parsed)
 
+    async def parse_reminder_manage_text(self, user_text: str) -> Dict[str, Any]:
+        prompt = f"""
+Ти парсер команд для керування нагадуваннями в Telegram-боті.
+Поверни СУВОРО лише JSON без markdown.
+
+Формат:
+{{
+  "intent": "manage_reminder",
+  "action": "list" | "delete" | "update" | "disable" | "enable",
+  "target_index": number | null,
+  "target_text": "рядок" | null,
+  "new_text": "рядок" | null,
+  "hour": number | null,
+  "minute": number | null
+}}
+
+Правила:
+- list: користувач хоче побачити нагадування
+- delete: видалити нагадування
+- disable: вимкнути нагадування
+- enable: увімкнути нагадування
+- update: змінити час або текст
+- якщо користувач вказує номер, поклади його в target_index
+- якщо користувач посилається на текст, поклади його в target_text
+- якщо нового часу нема, hour/minute = null
+
+Повідомлення:
+{user_text}
+"""
+        parsed = await self._call_claude_json(prompt, max_tokens=220)
+        return normalize_reminder_manage(parsed)
+
     async def parse_budget_create_text(self, user_text: str) -> Dict[str, Any]:
         prompt = f"""
 Ти парсер команд на створення бюджет-плану.
@@ -919,6 +1082,46 @@ class ClaudeParser:
 """
         parsed = await self._call_claude_json(prompt, max_tokens=260)
         return normalize_subscription_create(parsed, default_currency=self.default_currency)
+
+    async def parse_subscription_manage_text(self, user_text: str) -> Dict[str, Any]:
+        prompt = f"""
+Ти парсер команд для керування підписками у Firefly III.
+Поверни СУВОРО лише JSON без markdown.
+
+Формат:
+{{
+  "intent": "manage_subscription",
+  "action": "list" | "delete" | "update" | "disable" | "enable",
+  "target_name": "рядок" | null,
+  "target_id": "рядок" | null,
+  "name": "нова назва" | null,
+  "amount": number | null,
+  "currency": "{self.default_currency}",
+  "repeat_freq": "daily" | "weekly" | "monthly" | "yearly" | null,
+  "date": "YYYY-MM-DD" | null,
+  "day_of_month": number | null,
+  "weekday": number | null,
+  "month": number | null,
+  "day": number | null,
+  "skip": number | null,
+  "notes": "рядок" | null
+}}
+
+Правила:
+- list: користувач хоче побачити підписки
+- delete: видалити підписку
+- disable: вимкнути підписку
+- enable: увімкнути підписку
+- update: змінити суму, назву, розклад, нотатки
+- target_name має містити назву підписки, яку треба змінити
+- weekday: понеділок=1 ... неділя=7
+- якщо розклад не змінюється, repeat_freq і date можуть бути null
+
+Повідомлення:
+{user_text}
+"""
+        parsed = await self._call_claude_json(prompt, max_tokens=320)
+        return normalize_subscription_manage(parsed, default_currency=self.default_currency)
 
     async def answer_smalltalk(self, user_text: str) -> str:
         prompt = f"""

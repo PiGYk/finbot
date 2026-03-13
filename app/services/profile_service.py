@@ -93,6 +93,19 @@ class ProfileService:
 
         return profile_id
 
+    def list_bound_chat_ids_for_profile(self, profile_id: str) -> List[int]:
+        self._load()
+        result: List[int] = []
+        bindings = self._data.get("chat_bindings", {})
+        for raw_chat_id, bound_profile_id in bindings.items():
+            if bound_profile_id != profile_id:
+                continue
+            try:
+                result.append(int(raw_chat_id))
+            except (TypeError, ValueError):
+                continue
+        return result
+
     def bind_chat_to_profile(self, chat_id: int, profile_id: str) -> None:
         self._load()
 

@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -177,6 +177,159 @@ class FireflyClient:
 
         print("FIREFLY_SUBSCRIPTION_RESULT =", json.dumps(result, ensure_ascii=False))
         return result
+
+    async def _subscription_request(
+        self,
+        method: str,
+        subscription_id: Optional[str] = None,
+        json_payload: Optional[dict] = None,
+        params: Optional[dict] = None,
+    ) -> dict:
+        suffix = f"/{subscription_id}" if subscription_id else ""
+        last_error: Optional[Exception] = None
+        for base_path in ("/api/v1/bills", "/api/v1/subscriptions"):
+            try:
+                return await self.request(method, f"{base_path}{suffix}", json_payload=json_payload, params=params)
+            except Exception as e:
+                error_text = str(e)
+                if any(code in error_text for code in ("404", "405")):
+                    last_error = e
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Не вдалося виконати запит до підписок")
+
+    def _normalize_subscription_item(self, item: dict) -> dict:
+        attrs = item.get("attributes", {})
+        raw_date = str(
+            attrs.get("date")
+            or attrs.get("next_expected_match")
+            or attrs.get("pay_dates")
+            or attrs.get("created_at")
+            or datetime.now().strftime("%Y-%m-%d")
+        )
+        if len(raw_date) >= 10:
+            raw_date = raw_date[:10]
+
+        raw_repeat = str(attrs.get("repeat_freq") or attrs.get("repeat") or "monthly").lower().strip()
+        repeat_freq = raw_repeat if raw_repeat in {"daily", "weekly", "monthly", "yearly"} else "monthly"
+
+        return {
+            "id": str(item.get("id") or ""),
+            "name": str(attrs.get("name") or "Без назви").strip() or "Без назви",
+            "amount": round(parse_float(attrs.get("amount_min") or attrs.get("amount") or attrs.get("amount_max"), 0.0), 2),
+            "currency": str(attrs.get("currency_code") or attrs.get("currency_symbol") or "UAH").strip() or "UAH",
+            "date": raw_date,
+            "repeat_freq": repeat_freq,
+            "skip": max(0, int(parse_float(attrs.get("skip"), 0))),
+            "active": bool(attrs.get("active", True)),
+            "notes": attrs.get("notes") or None,
+            "raw": item,
+        }
+
+    async def list_subscriptions(self, active_only: bool = False) -> List[dict]:
+        data = await self._subscription_request("GET", params={"limit": 200})
+        items = [self._normalize_subscription_item(item) for item in data.get("data", [])]
+        items.sort(key=lambda item: item.get("name", "").lower())
+        if active_only:
+            return [item for item in items if item.get("active", True)]
+        return items
+
+    async def find_subscription(self, query: str) -> Optional[dict]:
+        query = str(query or "").strip()
+        if not query:
+            return None
+        items = await self.list_subscriptions(active_only=False)
+        for item in items:
+            if item["id"] == query:
+                return item
+        query_low = query.lower()
+        exact = [item for item in items if item["name"].lower() == query_low]
+        if exact:
+            return exact[0]
+        partial = [item for item in items if query_low in item["name"].lower()]
+        if len(partial) == 1:
+            return partial[0]
+        return None
+
+    async def update_subscription(self, subscription_id: str, updates: Dict[str, Any]) -> dict:
+        current = await self._subscription_request("GET", subscription_id=subscription_id)
+        current_item = self._normalize_subscription_item((current.get("data") or {}))
+        payload = {
+            "name": updates.get("name", current_item["name"]),
+            "amount_min": updates.get("amount", current_item["amount"]),
+            "amount_max": updates.get("amount", current_item["amount"]),
+            "date": updates.get("date", current_item["date"]),
+            "repeat_freq": updates.get("repeat_freq", current_item["repeat_freq"]),
+            "skip": int(updates.get("skip", current_item.get("skip", 0)) or 0),
+            "active": current_item.get("active", True) if updates.get("active") is None else bool(updates.get("active")),
+            "currency_code": updates.get("currency", current_item["currency"]),
+            "notes": updates.get("notes", current_item.get("notes")),
+        }
+        print("FIREFLY_UPDATE_SUBSCRIPTION_PAYLOAD =", json.dumps(payload, ensure_ascii=False))
+        try:
+            result = await self._subscription_request("PUT", subscription_id=subscription_id, json_payload=payload)
+        except Exception as e:
+            if "405" not in str(e):
+                raise
+            result = await self._subscription_request("PATCH", subscription_id=subscription_id, json_payload=payload)
+        print("FIREFLY_UPDATE_SUBSCRIPTION_RESULT =", json.dumps(result, ensure_ascii=False))
+        return result
+
+    async def delete_subscription(self, subscription_id: str) -> None:
+        print("FIREFLY_DELETE_SUBSCRIPTION_ID =", subscription_id)
+        await self._subscription_request("DELETE", subscription_id=subscription_id)
+
+    def _calculate_next_subscription_date(self, start_date_raw: str, repeat_freq: str, skip: int = 0) -> Optional[str]:
+        try:
+            start_date = datetime.strptime(str(start_date_raw)[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+        today = date.today()
+        candidate = start_date
+        step = max(1, int(skip or 0) + 1)
+        safety = 0
+
+        def add_months(d: date, months: int) -> date:
+            year = d.year + ((d.month - 1 + months) // 12)
+            month = ((d.month - 1 + months) % 12) + 1
+            day = min(d.day, [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
+            return date(year, month, day)
+
+        while candidate < today and safety < 1000:
+            if repeat_freq == "daily":
+                candidate += timedelta(days=step)
+            elif repeat_freq == "weekly":
+                candidate += timedelta(weeks=step)
+            elif repeat_freq == "monthly":
+                candidate = add_months(candidate, step)
+            elif repeat_freq == "yearly":
+                candidate = add_months(candidate, 12 * step)
+            else:
+                return None
+            safety += 1
+
+        return candidate.isoformat()
+
+    async def list_due_subscriptions(self, days_ahead: int = 2) -> List[dict]:
+        result: List[dict] = []
+        today = date.today()
+        horizon = today + timedelta(days=max(0, int(days_ahead)))
+        for item in await self.list_subscriptions(active_only=True):
+            next_date_raw = self._calculate_next_subscription_date(item.get("date", ""), item.get("repeat_freq", "monthly"), item.get("skip", 0))
+            if not next_date_raw:
+                continue
+            next_date = datetime.strptime(next_date_raw, "%Y-%m-%d").date()
+            if today <= next_date <= horizon:
+                enriched = dict(item)
+                enriched["next_date"] = next_date.isoformat()
+                enriched["days_left"] = (next_date - today).days
+                result.append(enriched)
+        result.sort(key=lambda item: (item.get("next_date", ""), item.get("name", "")))
+        return result
+
 
     async def create_transaction(self, parsed: Dict[str, Any], date_override: Optional[str] = None) -> dict:
         tx_type = parsed["type"]

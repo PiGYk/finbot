@@ -4,7 +4,7 @@ import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from app.services.firefly_client import FireflyClient
 
@@ -13,11 +13,9 @@ def parse_row_date(row: dict) -> Optional[date]:
     raw = row.get("date")
     if not raw:
         return None
-
     raw = str(raw)
     if len(raw) >= 10:
         raw = raw[:10]
-
     try:
         return datetime.strptime(raw, "%Y-%m-%d").date()
     except ValueError:
@@ -54,11 +52,9 @@ class BudgetService:
     def _load(self) -> None:
         if self._loaded:
             return
-
         with self._lock:
             if self._loaded:
                 return
-
             self._ensure_dir()
             if os.path.exists(self.file_path):
                 try:
@@ -68,7 +64,6 @@ class BudgetService:
                         self._data = loaded
                 except Exception:
                     self._data = {"budgets": []}
-
             self._loaded = True
 
     def _save(self) -> None:
@@ -80,46 +75,35 @@ class BudgetService:
         self._load()
         return len(self._data.get("budgets", []))
 
+    def list_budgets(self, chat_id: int) -> List[Dict[str, Any]]:
+        self._load()
+        items = [dict(item) for item in self._data.get("budgets", []) if int(item.get("chat_id", 0)) == int(chat_id)]
+        items.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return items
+
     def should_auto_suggest_after_income(self, text: str, parsed: Dict[str, Any]) -> bool:
         if parsed.get("type") != "income":
             return False
-
         joined = f"{text} {parsed.get('category', '')} {parsed.get('description', '')}".lower()
-
-        triggers = [
-            "зарплата",
-            "зп",
-            "salary",
-            "аванс",
-            "премія",
-            "bonus",
-            "дохід",
-        ]
-
+        triggers = ["зарплата", "зп", "salary", "аванс", "премія", "bonus", "дохід"]
         return any(trigger in joined for trigger in triggers)
 
     async def _recent_expense_distribution(self) -> Dict[str, float]:
         today = date.today()
         start = today - timedelta(days=29)
-
         rows = await self.firefly.list_transaction_rows(limit_pages=30)
         bucket: Dict[str, float] = defaultdict(float)
-
         for row in rows:
             row_date = parse_row_date(row)
             if row_date is None or not (start <= row_date <= today):
                 continue
-
             if str(row.get("type", "")).lower() != "withdrawal":
                 continue
-
             amount = parse_row_amount(row)
             if amount <= 0:
                 continue
-
             category = str(row.get("category_name") or row.get("destination_name") or "Інше").strip() or "Інше"
             bucket[category] += amount
-
         return dict(bucket)
 
     def _fallback_allocations(self, amount: float) -> List[Dict[str, Any]]:
@@ -128,7 +112,6 @@ class BudgetService:
         food = round(amount * 0.20, 2)
         flexible = round(amount * 0.10, 2)
         buffer_ = round(amount - savings - essentials - food - flexible, 2)
-
         return [
             {"category": "Заощадження", "amount": savings},
             {"category": "Обов’язкові витрати", "amount": essentials},
@@ -146,13 +129,11 @@ class BudgetService:
 
     async def create_budget_plan(self, chat_id: int, amount: float, title: Optional[str] = None) -> Dict[str, Any]:
         self._load()
-
         amount = round(float(amount), 2)
         if amount <= 0:
             raise ValueError("Сума бюджету має бути більшою за 0")
 
         history = await self._recent_expense_distribution()
-
         if not history:
             allocations = self._fallback_allocations(amount)
             based_on_history = False
@@ -160,12 +141,9 @@ class BudgetService:
             based_on_history = True
             savings = round(amount * 0.20, 2)
             distributable = round(amount - savings, 2)
-
             top = sorted(history.items(), key=lambda x: x[1], reverse=True)[:4]
             hist_total = sum(v for _, v in top)
-
             allocations = [{"category": "Заощадження", "amount": savings}]
-
             if hist_total <= 0:
                 allocations.extend(self._fallback_allocations(distributable))
             else:
@@ -174,12 +152,14 @@ class BudgetService:
                     part = round(distributable * (value / hist_total), 2)
                     allocations.append({"category": category, "amount": part})
                     used += part
-
                 remainder = round(amount - savings - used, 2)
                 if remainder > 0:
                     allocations.append({"category": "Буфер", "amount": remainder})
+                allocations = self._normalize_allocations_sum(allocations, amount)
 
-            allocations = self._normalize_allocations_sum(allocations, amount)
+        today = date.today()
+        next_month = today.replace(day=28) + timedelta(days=4)
+        month_end = next_month - timedelta(days=next_month.day)
 
         budget = {
             "id": int(time.time() * 1000),
@@ -189,14 +169,99 @@ class BudgetService:
             "amount": amount,
             "based_on_history": based_on_history,
             "allocations": allocations,
+            "period_start": today.replace(day=1).isoformat(),
+            "period_end": month_end.isoformat(),
             "created_at": datetime.utcnow().isoformat() + "Z",
         }
 
         with self._lock:
             self._data.setdefault("budgets", []).append(budget)
             self._save()
-
         return budget
+
+    def _resolve_budget(self, chat_id: int, target_index: Optional[int] = None, target_title: Optional[str] = None) -> Dict[str, Any]:
+        budgets = self.list_budgets(chat_id)
+        if not budgets:
+            raise ValueError("У тебе ще немає бюджетів")
+
+        if target_index is not None:
+            idx = int(target_index) - 1
+            if idx < 0 or idx >= len(budgets):
+                raise ValueError(f"Бюджету №{target_index} не існує")
+            return budgets[idx]
+
+        query = str(target_title or "").strip().lower()
+        if query:
+            matches = [item for item in budgets if query in str(item.get("title", "")).lower()]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise ValueError("Знайшов кілька схожих бюджетів. Уточни назву або номер.")
+            raise ValueError("Не знайшов бюджет за такою назвою")
+
+        return budgets[0]
+
+    async def compare_budget_to_actual(
+        self,
+        chat_id: int,
+        target_index: Optional[int] = None,
+        target_title: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        budget = self._resolve_budget(chat_id, target_index=target_index, target_title=target_title)
+
+        start_raw = str(budget.get("period_start") or budget.get("created_at") or "")[:10]
+        end_raw = str(budget.get("period_end") or date.today().isoformat())[:10]
+        try:
+            start = datetime.strptime(start_raw, "%Y-%m-%d").date()
+        except ValueError:
+            start = date.today().replace(day=1)
+        try:
+            end = datetime.strptime(end_raw, "%Y-%m-%d").date()
+        except ValueError:
+            end = date.today()
+
+        today = date.today()
+        if end > today:
+            end = today
+
+        rows = await self.firefly.list_transaction_rows(limit_pages=30)
+        actual_bucket: Dict[str, float] = defaultdict(float)
+        for row in rows:
+            row_date = parse_row_date(row)
+            if row_date is None or not (start <= row_date <= end):
+                continue
+            if str(row.get("type", "")).lower() != "withdrawal":
+                continue
+            category = str(row.get("category_name") or row.get("destination_name") or "Інше").strip() or "Інше"
+            actual_bucket[category] += parse_row_amount(row)
+
+        lines: List[Dict[str, Any]] = []
+        total_planned = 0.0
+        total_actual = 0.0
+        for item in budget.get("allocations", []):
+            category = str(item.get("category") or "Інше").strip() or "Інше"
+            planned = round(float(item.get("amount", 0) or 0), 2)
+            actual = round(float(actual_bucket.get(category, 0.0)), 2)
+            delta = round(actual - planned, 2)
+            total_planned += planned
+            total_actual += actual
+            lines.append({
+                "category": category,
+                "planned": planned,
+                "actual": actual,
+                "delta": delta,
+                "pct": round((actual / planned) * 100, 1) if planned > 0 else None,
+            })
+
+        return {
+            "budget": budget,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "lines": lines,
+            "total_planned": round(total_planned, 2),
+            "total_actual": round(total_actual, 2),
+            "total_delta": round(total_actual - total_planned, 2),
+        }
 
     def format_plan(self, budget: Dict[str, Any], intro: str = "Створив бюджет-план:") -> str:
         lines = [
@@ -204,16 +269,34 @@ class BudgetService:
             f"{budget['title']}",
             f"Сума: {budget['amount']:.2f} {budget['currency']}",
         ]
-
         if budget.get("based_on_history"):
             lines.append("Орієнтувався на твої витрати за останні 30 днів.")
         else:
             lines.append("Історії витрат замало, тому використав базовий шаблон.")
-
         lines.append("")
         lines.append("Рекомендований розподіл:")
-
         for item in budget.get("allocations", []):
             lines.append(f"• {item['category']} — {item['amount']:.2f} {budget['currency']}")
+        if budget.get("period_start") and budget.get("period_end"):
+            lines.append("")
+            lines.append(f"Період: {budget['period_start']} → {budget['period_end']}")
+        return "\n".join(lines)
 
+    def format_comparison(self, payload: Dict[str, Any]) -> str:
+        budget = payload["budget"]
+        currency = budget.get("currency", self.default_currency)
+        lines = [
+            f"Бюджет vs факт: {budget.get('title', 'Бюджет')}",
+            f"Період: {payload['start']} → {payload['end']}",
+            f"Разом план: {payload['total_planned']:.2f} {currency}",
+            f"Разом факт: {payload['total_actual']:.2f} {currency}",
+            f"Різниця: {payload['total_delta']:+.2f} {currency}",
+            "",
+            "По категоріях:",
+        ]
+        for item in payload.get("lines", []):
+            pct = f" ({item['pct']:.1f}% від плану)" if item.get("pct") is not None else ""
+            lines.append(
+                f"• {item['category']}: план {item['planned']:.2f}, факт {item['actual']:.2f}, різниця {item['delta']:+.2f} {currency}{pct}"
+            )
         return "\n".join(lines)
