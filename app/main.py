@@ -53,8 +53,6 @@ def parse_allowed_chat_ids(raw: str) -> set[int]:
 
 
 def is_chat_allowed(chat_id: int) -> bool:
-    # Якщо whitelist порожній, бот відкритий.
-    # Як тільки додаси хоча б один chat_id у .env, почне працювати обмеження.
     if not ALLOWED_CHAT_IDS:
         return True
     return chat_id in ALLOWED_CHAT_IDS
@@ -124,6 +122,45 @@ def format_balance_setup_result(results: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def format_last_transaction_action_result(result: dict) -> str:
+    action = result.get("action")
+    currency = result.get("currency", DEFAULT_CURRENCY)
+
+    if action == "deleted":
+        return (
+            f"Видалив останню транзакцію:\n"
+            f"• Тип: {result.get('old_type')}\n"
+            f"• Сума: {result.get('old_amount', 0):.2f} {currency}\n"
+            f"• Опис: {result.get('old_description')}"
+        )
+
+    if action == "updated":
+        lines = [
+            "Оновив останню транзакцію:",
+            f"• Було: {result.get('old_amount', 0):.2f} {currency} | {result.get('old_description')}",
+            f"• Стало: {result.get('new_amount', 0):.2f} {currency} | {result.get('new_description')}",
+        ]
+
+        if result.get("old_source_account") != result.get("new_source_account"):
+            lines.append(
+                f"• Рахунок: {result.get('old_source_account')} → {result.get('new_source_account')}"
+            )
+
+        if result.get("old_destination_account") != result.get("new_destination_account"):
+            lines.append(
+                f"• Призначення: {result.get('old_destination_account')} → {result.get('new_destination_account')}"
+            )
+
+        if result.get("old_category") != result.get("new_category"):
+            lines.append(
+                f"• Категорія: {result.get('old_category')} → {result.get('new_category')}"
+            )
+
+        return "\n".join(lines)
+
+    return "Невідомий результат дії над останньою транзакцією."
+
+
 @app.get("/health")
 async def health() -> dict:
     return {
@@ -151,8 +188,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
     if not chat_id:
         return {"ok": True}
 
-    # Мінімальна сек'юрність: якщо chat_id не у whitelist,
-    # одразу відбиваємося і НЕ витрачаємо Claude / Firefly взагалі.
+    # Whitelist перевіряємо до Claude / Firefly
     if not is_chat_allowed(chat_id):
         await send_telegram_message(
             chat_id,
@@ -176,6 +212,17 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             parsed_setup = await claude.parse_balance_setup_text(text)
             results = await firefly.setup_balances(parsed_setup["accounts"])
             await send_telegram_message(chat_id, format_balance_setup_result(results))
+            return {"ok": True}
+
+        if claude.looks_like_last_transaction_action_request(text):
+            account_names = await firefly.list_asset_account_names()
+            action_spec = await claude.parse_last_transaction_action_text(text, account_names)
+            result = await firefly.apply_last_transaction_action(
+                action_spec=action_spec,
+                default_currency=DEFAULT_CURRENCY,
+                default_source_account=DEFAULT_SOURCE_ACCOUNT,
+            )
+            await send_telegram_message(chat_id, format_last_transaction_action_result(result))
             return {"ok": True}
 
         report_reply = await reports.handle_report_request(text)
