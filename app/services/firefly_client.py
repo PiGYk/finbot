@@ -150,6 +150,34 @@ class FireflyClient:
             return
         await self.create_category(name)
 
+    async def create_subscription(self, parsed: Dict[str, Any]) -> dict:
+        payload = {
+            "name": parsed["name"],
+            "amount_min": parsed["amount"],
+            "amount_max": parsed["amount"],
+            "date": parsed["date"],
+            "repeat_freq": parsed["repeat_freq"],
+            "skip": int(parsed.get("skip", 0) or 0),
+            "active": True,
+            "currency_code": parsed["currency"],
+        }
+
+        if parsed.get("notes"):
+            payload["notes"] = parsed["notes"]
+
+        print("FIREFLY_SUBSCRIPTION_PAYLOAD =", json.dumps(payload, ensure_ascii=False))
+
+        try:
+            result = await self.request("POST", "/api/v1/bills", json_payload=payload)
+        except Exception as first_error:
+            error_text = str(first_error)
+            if "404" not in error_text and "405" not in error_text:
+                raise
+            result = await self.request("POST", "/api/v1/subscriptions", json_payload=payload)
+
+        print("FIREFLY_SUBSCRIPTION_RESULT =", json.dumps(result, ensure_ascii=False))
+        return result
+
     async def create_transaction(self, parsed: Dict[str, Any], date_override: Optional[str] = None) -> dict:
         tx_type = parsed["type"]
         amount = parsed["amount"]

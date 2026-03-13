@@ -1,5 +1,7 @@
+import calendar
 import json
 import re
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List
 
 
@@ -270,6 +272,146 @@ def normalize_budget_create(parsed: Dict[str, Any], default_currency: str) -> Di
     }
 
 
+def normalize_optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def validate_iso_date(raw: str) -> str:
+    text = normalize_text(raw, "")
+    if not text:
+        raise ValueError("Не вдалося визначити дату підписки")
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
+    except ValueError as e:
+        raise ValueError(f"Некоректна дата підписки: {text}") from e
+
+
+def resolve_subscription_date(
+    repeat_freq: str,
+    raw_date: Any,
+    day_of_month: int | None,
+    weekday: int | None,
+    month: int | None,
+    day: int | None,
+) -> str:
+    if raw_date:
+        return validate_iso_date(str(raw_date))
+
+    today = datetime.now().date()
+
+    if repeat_freq == "daily":
+        return today.isoformat()
+
+    if repeat_freq == "weekly":
+        weekday = weekday or (today.weekday() + 1)
+        weekday = max(1, min(7, weekday))
+        delta_days = (weekday - 1 - today.weekday()) % 7
+        return (today + timedelta(days=delta_days)).isoformat()
+
+    if repeat_freq == "monthly":
+        day_of_month = day_of_month or day or today.day
+        day_of_month = max(1, min(31, day_of_month))
+
+        year = today.year
+        month_value = today.month
+        candidate_day = min(day_of_month, calendar.monthrange(year, month_value)[1])
+        candidate = date(year, month_value, candidate_day)
+
+        if candidate < today:
+            if month_value == 12:
+                year += 1
+                month_value = 1
+            else:
+                month_value += 1
+            candidate_day = min(day_of_month, calendar.monthrange(year, month_value)[1])
+            candidate = date(year, month_value, candidate_day)
+
+        return candidate.isoformat()
+
+    if repeat_freq == "yearly":
+        month = month or today.month
+        day = day or day_of_month or today.day
+
+        month = max(1, min(12, month))
+        day = max(1, min(31, day))
+
+        candidate_day = min(day, calendar.monthrange(today.year, month)[1])
+        candidate = date(today.year, month, candidate_day)
+
+        if candidate < today:
+            next_year = today.year + 1
+            candidate_day = min(day, calendar.monthrange(next_year, month)[1])
+            candidate = date(next_year, month, candidate_day)
+
+        return candidate.isoformat()
+
+    raise ValueError(f"Непідтримуваний repeat_freq: {repeat_freq}")
+
+
+def normalize_subscription_create(parsed: Dict[str, Any], default_currency: str) -> Dict[str, Any]:
+    intent = normalize_text(parsed.get("intent"), "").lower()
+    if intent != "create_subscription":
+        raise ValueError(f"Непідтримуваний intent: {intent}")
+
+    amount = normalize_amount(parsed.get("amount"))
+    currency = normalize_text(parsed.get("currency"), default_currency).upper()
+    repeat_freq = normalize_text(parsed.get("repeat_freq"), "monthly").lower()
+
+    if repeat_freq not in {"daily", "weekly", "monthly", "yearly"}:
+        raise ValueError(f"Непідтримуваний repeat_freq: {repeat_freq}")
+
+    skip = parsed.get("skip", 0)
+    try:
+        skip = int(skip)
+    except (TypeError, ValueError):
+        skip = 0
+    if skip < 0:
+        skip = 0
+
+    day_of_month = normalize_optional_int(parsed.get("day_of_month"))
+    weekday = normalize_optional_int(parsed.get("weekday"))
+    month = normalize_optional_int(parsed.get("month"))
+    day = normalize_optional_int(parsed.get("day"))
+
+    sub_date = resolve_subscription_date(
+        repeat_freq=repeat_freq,
+        raw_date=parsed.get("date"),
+        day_of_month=day_of_month,
+        weekday=weekday,
+        month=month,
+        day=day,
+    )
+
+    name = normalize_text(parsed.get("name"), "")
+    if not name:
+        if repeat_freq == "monthly" and day_of_month:
+            name = f"Підписка {day_of_month} числа"
+        elif repeat_freq == "weekly" and weekday:
+            name = "Щотижнева підписка"
+        elif repeat_freq == "yearly":
+            name = "Щорічна підписка"
+        else:
+            name = "Регулярна підписка"
+
+    notes = normalize_text(parsed.get("notes"), "")
+
+    return {
+        "intent": "create_subscription",
+        "name": name,
+        "amount": amount,
+        "currency": currency,
+        "repeat_freq": repeat_freq,
+        "date": sub_date,
+        "skip": skip,
+        "notes": notes or None,
+    }
+
+
 def normalize_intent(parsed: Dict[str, Any]) -> str:
     intent = normalize_text(parsed.get("intent"), "").lower()
     allowed = {
@@ -373,6 +515,39 @@ class ClaudeParser:
                 or "розділи" in low
             )
         )
+
+    def looks_like_subscription_create_request(self, text: str) -> bool:
+        low = text.strip().lower()
+        create_words = ("додай", "додати", "створи", "створити", "зроби", "оформи", "оформити", "заведи")
+        schedule_words = (
+            "кожен",
+            "щодня",
+            "щотиж",
+            "щоміся",
+            "щорок",
+            "числ",
+            "понед",
+            "вівтор",
+            "серед",
+            "четвер",
+            "пʼят",
+            "пят",
+            "субот",
+            "неділ",
+        )
+
+        has_create_word = any(word in low for word in create_words)
+        has_schedule_word = any(word in low for word in schedule_words)
+        has_subscription_word = (
+            "підписк" in low
+            or "регулярн" in low
+            or "автоспис" in low
+            or "регулярний плат" in low
+            or "регулярну оплат" in low
+        )
+        has_amount_hint = any(ch.isdigit() for ch in low)
+
+        return has_subscription_word and (has_create_word or (has_schedule_word and has_amount_hint))
 
     async def _call_claude_json(self, prompt: str, max_tokens: int = 350) -> Dict[str, Any]:
         import httpx
@@ -673,6 +848,77 @@ class ClaudeParser:
 """
         parsed = await self._call_claude_json(prompt, max_tokens=180)
         return normalize_budget_create(parsed, default_currency=self.default_currency)
+
+    async def parse_subscription_create_text(self, user_text: str) -> Dict[str, Any]:
+        prompt = f"""
+Ти парсер команд на створення підписок у Firefly III.
+Поверни СУВОРО лише JSON без markdown.
+
+Формат:
+{{
+  "intent": "create_subscription",
+  "name": "назва підписки",
+  "amount": number,
+  "currency": "{self.default_currency}",
+  "repeat_freq": "daily" | "weekly" | "monthly" | "yearly",
+  "date": "YYYY-MM-DD" | null,
+  "day_of_month": number | null,
+  "weekday": number | null,
+  "month": number | null,
+  "day": number | null,
+  "skip": number,
+  "notes": "рядок" | null
+}}
+
+Правила:
+- якщо користувач пише "20-те число" або "20 числа", це monthly і day_of_month = 20
+- weekday: понеділок=1, вівторок=2, середа=3, четвер=4, пʼятниця=5, субота=6, неділя=7
+- якщо користувач пише "раз на 2 місяці", то repeat_freq = monthly і skip = 1
+- якщо користувач пише "раз на 3 місяці", то repeat_freq = monthly і skip = 2
+- якщо явної назви нема, придумай коротку зрозумілу назву
+- amount має бути додатним числом
+- date можна не заповнювати, якщо розклад описаний через day_of_month / weekday / month + day
+
+Приклади:
+Вхід: додай підписку netflix 20 числа 239 грн
+Вихід:
+{{
+  "intent": "create_subscription",
+  "name": "Netflix",
+  "amount": 239,
+  "currency": "{self.default_currency}",
+  "repeat_freq": "monthly",
+  "date": null,
+  "day_of_month": 20,
+  "weekday": null,
+  "month": null,
+  "day": null,
+  "skip": 0,
+  "notes": null
+}}
+
+Вхід: створи регулярний платіж спортзал щопонеділка 300 грн
+Вихід:
+{{
+  "intent": "create_subscription",
+  "name": "Спортзал",
+  "amount": 300,
+  "currency": "{self.default_currency}",
+  "repeat_freq": "weekly",
+  "date": null,
+  "day_of_month": null,
+  "weekday": 1,
+  "month": null,
+  "day": null,
+  "skip": 0,
+  "notes": null
+}}
+
+Повідомлення:
+{user_text}
+"""
+        parsed = await self._call_claude_json(prompt, max_tokens=260)
+        return normalize_subscription_create(parsed, default_currency=self.default_currency)
 
     async def answer_smalltalk(self, user_text: str) -> str:
         prompt = f"""

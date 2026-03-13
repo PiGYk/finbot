@@ -327,6 +327,26 @@ def format_transfer_result(parsed: dict[str, Any]) -> str:
     )
 
 
+def format_subscription_result(parsed: dict[str, Any], result: dict[str, Any]) -> str:
+    subscription_id = ((result.get("data") or {}).get("id"))
+    lines = [
+        "Підписку створив:",
+        f"• Назва: {parsed['name']}",
+        f"• Сума: {float(parsed['amount']):.2f} {parsed['currency']}",
+        f"• Періодичність: {parsed['repeat_freq']}",
+        f"• Перша дата: {parsed['date']}",
+    ]
+
+    skip = int(parsed.get("skip", 0) or 0)
+    if skip > 0:
+        lines.append(f"• Skip: {skip}")
+
+    if subscription_id:
+        lines.append(f"• ID у Firefly: {subscription_id}")
+
+    return "\n".join(lines)
+
+
 
 def format_last_transaction_action_result(result: dict[str, Any], default_currency: str) -> str:
     action = result.get("action")
@@ -657,6 +677,12 @@ async def handle_text_message(chat_id: int, runtime: ProfileRuntime, text: str) 
             title=parsed_budget["title"],
         )
         await send_telegram_message(chat_id, runtime.budget_service.format_plan(budget))
+        return
+
+    if runtime.claude.looks_like_subscription_create_request(text):
+        parsed_subscription = await runtime.claude.parse_subscription_create_text(text)
+        result = await runtime.firefly.create_subscription(parsed_subscription)
+        await send_telegram_message(chat_id, format_subscription_result(parsed_subscription, result))
         return
 
     if runtime.claude.looks_like_transfer_request(text):
