@@ -70,23 +70,17 @@ class FireflyClient:
             return response.json()
 
     async def list_asset_accounts(self) -> List[dict]:
-        data = await self.request(
-            "GET",
-            "/api/v1/accounts",
-            params={"type": "asset", "limit": 200},
-        )
+        data = await self.request("GET", "/api/v1/accounts", params={"type": "asset", "limit": 200})
         return data.get("data", [])
 
     async def list_asset_account_names(self) -> List[str]:
         items = await self.list_asset_accounts()
         names: List[str] = []
-
         for item in items:
             attrs = item.get("attributes", {})
             name = attrs.get("name")
             if name:
                 names.append(name)
-
         return names
 
     async def find_asset_account_by_name(self, name: str) -> Optional[dict]:
@@ -114,12 +108,7 @@ class FireflyClient:
 
         return 0.0
 
-    async def create_asset_account(
-        self,
-        name: str,
-        currency_code: str,
-        opening_balance: float = 0.0,
-    ) -> dict:
+    async def create_asset_account(self, name: str, currency_code: str, opening_balance: float = 0.0) -> dict:
         today = datetime.now().strftime("%Y-%m-%d")
         account_role = guess_asset_account_role(name)
 
@@ -161,11 +150,7 @@ class FireflyClient:
             return
         await self.create_category(name)
 
-    async def create_transaction(
-        self,
-        parsed: Dict[str, Any],
-        date_override: Optional[str] = None,
-    ) -> dict:
+    async def create_transaction(self, parsed: Dict[str, Any], date_override: Optional[str] = None) -> dict:
         tx_type = parsed["type"]
         amount = parsed["amount"]
         category = parsed["category"]
@@ -224,11 +209,7 @@ class FireflyClient:
         print("FIREFLY_RESULT =", json.dumps(result, ensure_ascii=False))
         return result
 
-    async def create_transfer(
-        self,
-        parsed: Dict[str, Any],
-        date_override: Optional[str] = None,
-    ) -> dict:
+    async def create_transfer(self, parsed: Dict[str, Any], date_override: Optional[str] = None) -> dict:
         amount = parsed["amount"]
         currency = parsed["currency"]
         source_account = parsed["source_account"]
@@ -271,12 +252,7 @@ class FireflyClient:
         print("FIREFLY_TRANSFER_RESULT =", json.dumps(result, ensure_ascii=False))
         return result
 
-    async def create_receipt_transactions(
-        self,
-        receipt: Dict[str, Any],
-        default_source_account: str,
-        default_currency: str,
-    ) -> dict:
+    async def create_receipt_transactions(self, receipt: Dict[str, Any], default_source_account: str, default_currency: str) -> dict:
         source_account = receipt.get("source_account") or default_source_account
         currency = receipt.get("currency") or default_currency
         merchant = receipt.get("merchant") or "Чек"
@@ -435,13 +411,8 @@ class FireflyClient:
         return results
 
     async def list_recent_transaction_groups(self, limit: int = 50) -> List[dict]:
-        data = await self.request(
-            "GET",
-            "/api/v1/transactions",
-            params={"page": 1, "limit": limit},
-        )
+        data = await self.request("GET", "/api/v1/transactions", params={"page": 1, "limit": limit})
         items = data.get("data", [])
-
         items.sort(key=lambda x: int(x.get("id", 0)), reverse=True)
         return items
 
@@ -478,14 +449,101 @@ class FireflyClient:
     def _get_group_splits(self, group_item: dict) -> List[dict]:
         attrs = group_item.get("attributes", {})
         splits = attrs.get("transactions") or []
-
         result: List[dict] = []
         for split in splits:
             row = dict(split)
             if attrs.get("group_title") and not row.get("description"):
                 row["description"] = attrs["group_title"]
             result.append(row)
+        return result
 
+    def _split_label(self, split: dict, index: int) -> str:
+        category = split.get("category_name") or split.get("destination_name") or "Без категорії"
+        description = split.get("description") or "Без опису"
+        amount = abs(parse_float(split.get("amount"), 0.0))
+        return f"{index + 1}. {category} | {description} | {amount:.2f}"
+
+    def _list_split_labels(self, splits: List[dict]) -> str:
+        return "; ".join(self._split_label(split, idx) for idx, split in enumerate(splits))
+
+    def _find_target_split_index(self, action_spec: Dict[str, Any], splits: List[dict]) -> Optional[int]:
+        target_index = action_spec.get("target_index")
+        target_category = (action_spec.get("target_category") or "").strip().lower()
+        target_description = (action_spec.get("target_description") or "").strip().lower()
+
+        if target_index is not None:
+            idx = target_index - 1
+            if 0 <= idx < len(splits):
+                return idx
+            raise ValueError(f"Частини №{target_index} не існує. Доступні частини: {self._list_split_labels(splits)}")
+
+        candidates = list(range(len(splits)))
+
+        if target_category:
+            filtered = []
+            for i in candidates:
+                split = splits[i]
+                category = str(split.get("category_name") or split.get("destination_name") or "").strip().lower()
+                if target_category in category:
+                    filtered.append(i)
+            candidates = filtered
+
+        if target_description:
+            filtered = []
+            for i in candidates:
+                split = splits[i]
+                description = str(split.get("description") or "").strip().lower()
+                if target_description in description:
+                    filtered.append(i)
+            candidates = filtered
+
+        if target_category or target_description:
+            if len(candidates) == 1:
+                return candidates[0]
+            if len(candidates) == 0:
+                raise ValueError(
+                    f"Не знайшов потрібну частину в останній транзакції. Доступні частини: {self._list_split_labels(splits)}"
+                )
+            raise ValueError(
+                f"Знайшов кілька схожих частин. Уточни категорію або номер частини. Доступні частини: {self._list_split_labels(splits)}"
+            )
+
+        if len(splits) == 1:
+            return 0
+
+        return None
+
+    def _build_split_payload(self, split: dict) -> dict:
+        tx_type = str(split.get("type", "")).lower()
+        payload = {
+            "type": tx_type,
+            "date": str(split.get("date") or datetime.now().strftime("%Y-%m-%d"))[:10],
+            "amount": str(abs(parse_float(split.get("amount"), 0.0))),
+            "description": split.get("description") or "Операція",
+            "source_name": split.get("source_name"),
+            "destination_name": split.get("destination_name"),
+            "currency_code": split.get("currency_code"),
+        }
+
+        if tx_type in {"withdrawal", "deposit"}:
+            category_name = split.get("category_name")
+            if category_name:
+                payload["category_name"] = category_name
+
+        return payload
+
+    async def _recreate_group(self, group_title: str, splits: List[dict]) -> dict:
+        payload = {
+            "error_if_duplicate_hash": False,
+            "apply_rules": True,
+            "fire_webhooks": True,
+            "group_title": group_title,
+            "transactions": [self._build_split_payload(split) for split in splits],
+        }
+
+        print("FIREFLY_RECREATE_GROUP_PAYLOAD =", json.dumps(payload, ensure_ascii=False))
+        result = await self.request("POST", "/api/v1/transactions", json_payload=payload)
+        print("FIREFLY_RECREATE_GROUP_RESULT =", json.dumps(result, ensure_ascii=False))
         return result
 
     async def apply_last_transaction_action(
@@ -495,105 +553,127 @@ class FireflyClient:
         default_source_account: str,
     ) -> dict:
         last_group = await self.get_last_transaction_group()
-
         group_id = str(last_group.get("id"))
         attrs = last_group.get("attributes", {})
+        group_title = attrs.get("group_title") or "Операція"
         splits = self._get_group_splits(last_group)
 
         if not splits:
             raise ValueError("Не знайшов спліт останньої транзакції")
 
-        first = splits[0]
-
-        tx_type = str(first.get("type", "")).lower()
-        old_amount = abs(parse_float(first.get("amount"), 0.0))
-        old_currency = first.get("currency_code") or default_currency
-        old_description = first.get("description") or attrs.get("group_title") or "Операція"
-
-        old_source_account = first.get("source_name")
-        old_destination_account = first.get("destination_name")
-        old_category = first.get("category_name") or old_destination_account or "Інше"
-
-        print("LAST_GROUP_ID =", group_id)
-        print("LAST_GROUP_TITLE =", attrs.get("group_title"))
-        print("LAST_GROUP_FIRST_SPLIT =", json.dumps(first, ensure_ascii=False))
+        target_idx = self._find_target_split_index(action_spec, splits)
 
         if action_spec["action"] == "delete":
-            await self.delete_transaction_group(group_id)
+            if target_idx is None:
+                first = splits[0]
+                old_amount = abs(parse_float(first.get("amount"), 0.0))
+                old_currency = first.get("currency_code") or default_currency
+                old_description = first.get("description") or group_title
+
+                await self.delete_transaction_group(group_id)
+                return {
+                    "action": "deleted",
+                    "old_type": str(first.get("type", "")).lower(),
+                    "old_amount": old_amount,
+                    "currency": old_currency,
+                    "old_description": old_description,
+                }
+
+            target_split = dict(splits[target_idx])
+            remaining_splits = [dict(s) for i, s in enumerate(splits) if i != target_idx]
+
+            old_amount = abs(parse_float(target_split.get("amount"), 0.0))
+            old_currency = target_split.get("currency_code") or default_currency
+            old_description = target_split.get("description") or group_title
+
+            if not remaining_splits:
+                await self.delete_transaction_group(group_id)
+            else:
+                await self._recreate_group(group_title, remaining_splits)
+                await self.delete_transaction_group(group_id)
 
             return {
-                "action": "deleted",
-                "old_type": tx_type,
+                "action": "deleted_split",
+                "target_label": self._split_label(target_split, target_idx),
                 "old_amount": old_amount,
                 "currency": old_currency,
                 "old_description": old_description,
-                "old_source_account": old_source_account,
-                "old_destination_account": old_destination_account,
-                "old_category": old_category,
             }
 
-        if len(splits) != 1:
+        if target_idx is None and len(splits) > 1:
             raise ValueError(
-                "Остання транзакція має кілька частин. Її можна видалити, але редагування цієї версії поки що тільки для одиночних транзакцій."
+                f"Остання транзакція має кілька частин. Уточни, що саме міняти: {self._list_split_labels(splits)}"
             )
 
-        tx_date = str(first.get("date") or datetime.now().strftime("%Y-%m-%d"))[:10]
+        target_idx = 0 if target_idx is None else target_idx
+        target_split = dict(splits[target_idx])
+
+        tx_type = str(target_split.get("type", "")).lower()
+        old_amount = abs(parse_float(target_split.get("amount"), 0.0))
+        old_currency = target_split.get("currency_code") or default_currency
+        old_description = target_split.get("description") or group_title
+        old_source_account = target_split.get("source_name")
+        old_destination_account = target_split.get("destination_name")
+        old_category = target_split.get("category_name") or old_destination_account or "Інше"
+
+        new_split = dict(target_split)
+
+        if action_spec["amount"] is not None:
+            new_split["amount"] = str(action_spec["amount"])
+
+        if action_spec["description"]:
+            new_split["description"] = action_spec["description"]
 
         if tx_type == "withdrawal":
-            parsed = {
-                "type": "expense",
-                "amount": action_spec["amount"] if action_spec["amount"] is not None else old_amount,
-                "currency": action_spec.get("currency") or old_currency,
-                "category": action_spec["category"] or old_category,
-                "description": action_spec["description"] or old_description,
-                "source_account": action_spec["source_account"] or old_source_account or default_source_account,
-            }
-            new_result = await self.create_transaction(parsed, date_override=tx_date)
-            new_source_account = parsed["source_account"]
-            new_destination_account = parsed["category"]
-            new_category = parsed["category"]
-            new_amount = parsed["amount"]
-            new_description = parsed["description"]
+            if action_spec["source_account"]:
+                new_split["source_name"] = action_spec["source_account"]
+
+            new_category = action_spec["category"] or (action_spec["destination_account"] or None)
+            if new_category:
+                await self.ensure_category(new_category)
+                new_split["destination_name"] = new_category
+                new_split["category_name"] = new_category
 
         elif tx_type == "deposit":
-            parsed = {
-                "type": "income",
-                "amount": action_spec["amount"] if action_spec["amount"] is not None else old_amount,
-                "currency": action_spec.get("currency") or old_currency,
-                "category": action_spec["category"] or first.get("category_name") or first.get("source_name") or "Інше",
-                "description": action_spec["description"] or old_description,
-                "source_account": action_spec["destination_account"] or action_spec["source_account"] or first.get("destination_name") or default_source_account,
-            }
-            new_result = await self.create_transaction(parsed, date_override=tx_date)
-            new_source_account = parsed["source_account"]
-            new_destination_account = parsed["category"]
-            new_category = parsed["category"]
-            new_amount = parsed["amount"]
-            new_description = parsed["description"]
+            if action_spec["destination_account"] or action_spec["source_account"]:
+                new_split["destination_name"] = action_spec["destination_account"] or action_spec["source_account"]
+
+            if action_spec["category"]:
+                await self.ensure_category(action_spec["category"])
+                new_split["source_name"] = action_spec["category"]
+                new_split["category_name"] = action_spec["category"]
 
         elif tx_type == "transfer":
-            parsed = {
-                "amount": action_spec["amount"] if action_spec["amount"] is not None else old_amount,
-                "currency": action_spec.get("currency") or old_currency,
-                "source_account": action_spec["source_account"] or old_source_account,
-                "destination_account": action_spec["destination_account"] or old_destination_account,
-                "description": action_spec["description"] or old_description,
-            }
-            new_result = await self.create_transfer(parsed, date_override=tx_date)
-            new_source_account = parsed["source_account"]
-            new_destination_account = parsed["destination_account"]
-            new_category = None
-            new_amount = parsed["amount"]
-            new_description = parsed["description"]
+            if action_spec["source_account"]:
+                new_split["source_name"] = action_spec["source_account"]
+            if action_spec["destination_account"]:
+                new_split["destination_name"] = action_spec["destination_account"]
 
+            if new_split.get("source_name") == new_split.get("destination_name"):
+                raise ValueError("Рахунок-відправник і рахунок-отримувач однакові")
         else:
             raise ValueError(f"Непідтримуваний тип останньої транзакції: {tx_type}")
 
+        new_splits = [dict(s) for s in splits]
+        new_splits[target_idx] = new_split
+
+        new_group_title = group_title
+        if len(new_splits) == 1:
+            new_group_title = new_split.get("description") or group_title
+
+        recreate_result = await self._recreate_group(new_group_title, new_splits)
         await self.delete_transaction_group(group_id)
+
+        new_amount = abs(parse_float(new_split.get("amount"), 0.0))
+        new_description = new_split.get("description") or new_group_title
+        new_source_account = new_split.get("source_name")
+        new_destination_account = new_split.get("destination_name")
+        new_category = new_split.get("category_name") or new_destination_account or "Інше"
 
         return {
             "action": "updated",
             "currency": old_currency,
+            "target_label": self._split_label(target_split, target_idx),
             "old_type": tx_type,
             "old_amount": old_amount,
             "new_amount": new_amount,
@@ -605,7 +685,7 @@ class FireflyClient:
             "new_destination_account": new_destination_account,
             "old_category": old_category,
             "new_category": new_category,
-            "result": new_result,
+            "result": recreate_result,
         }
 
     async def list_transaction_rows(self, limit_pages: int = 20) -> List[dict]:

@@ -141,6 +141,15 @@ def normalize_last_transaction_action(parsed: Dict[str, Any], default_currency: 
     if amount is not None:
         amount = normalize_amount(amount)
 
+    target_index = parsed.get("target_index")
+    if target_index is not None:
+        try:
+            target_index = int(target_index)
+        except (TypeError, ValueError):
+            target_index = None
+        if target_index is not None and target_index <= 0:
+            target_index = None
+
     category = parsed.get("category")
     if category is not None:
         category = normalize_text(category, "")
@@ -157,6 +166,14 @@ def normalize_last_transaction_action(parsed: Dict[str, Any], default_currency: 
     if destination_account is not None:
         destination_account = normalize_text(destination_account, "")
 
+    target_category = parsed.get("target_category")
+    if target_category is not None:
+        target_category = normalize_text(target_category, "")
+
+    target_description = parsed.get("target_description")
+    if target_description is not None:
+        target_description = normalize_text(target_description, "")
+
     currency = normalize_text(parsed.get("currency"), default_currency).upper()
 
     return {
@@ -168,6 +185,9 @@ def normalize_last_transaction_action(parsed: Dict[str, Any], default_currency: 
         "description": description,
         "source_account": source_account,
         "destination_account": destination_account,
+        "target_index": target_index,
+        "target_category": target_category,
+        "target_description": target_description,
     }
 
 
@@ -244,6 +264,8 @@ class ClaudeParser:
             "останній дохід",
             "останній переказ",
             "останньої транзакц",
+            "останнього чеку",
+            "в останньому чеку",
         ]
 
         return any(trigger in low for trigger in triggers)
@@ -344,23 +366,6 @@ class ClaudeParser:
 - finance_advice: користувач хоче аналіз, висновки, поради, рекомендації. Приклади: "на що мені зменшити витрати", "що в мене не так по витратах"
 - smalltalk: звичайна розмова, не фінансова дія і не звіт. Приклади: "як справи", "шо нового", "ти тут?"
 
-Приклади:
-Вхід: як справи
-Вихід:
-{{"intent": "smalltalk"}}
-
-Вхід: кава 200
-Вихід:
-{{"intent": "finance_write"}}
-
-Вхід: скільки я витратив за місяць
-Вихід:
-{{"intent": "finance_query"}}
-
-Вхід: на що я б міг зменшити витрати
-Вихід:
-{{"intent": "finance_advice"}}
-
 Повідомлення:
 {user_text}
 """
@@ -392,40 +397,15 @@ class ClaudeParser:
 - description короткий нормальний опис
 - source_account за замовчуванням "{self.default_source_account}"
 
-Приклади:
-
-Вхід: кава 200
-Вихід:
-{{
-  "type": "expense",
-  "amount": 200,
-  "currency": "{self.default_currency}",
-  "category": "Кава",
-  "description": "Кава",
-  "source_account": "{self.default_source_account}"
-}}
-
-Вхід: зарплата 25000
-Вихід:
-{{
-  "type": "income",
-  "amount": 25000,
-  "currency": "{self.default_currency}",
-  "category": "Зарплата",
-  "description": "Зарплата",
-  "source_account": "{self.default_source_account}"
-}}
-
 Повідомлення:
 {user_text}
 """
         parsed = await self._call_claude_json(prompt)
-        normalized = normalize_parsed(
+        return normalize_parsed(
             parsed,
             default_currency=self.default_currency,
             default_source_account=self.default_source_account,
         )
-        return normalized
 
     async def parse_balance_setup_text(self, user_text: str) -> Dict[str, Any]:
         prompt = f"""
@@ -453,53 +433,14 @@ class ClaudeParser:
 - якщо в тексті кілька рахунків, поверни кілька об'єктів у accounts
 - якщо є мінус, повертай balance додатнім числом
 
-Приклади:
-
-Вхід: встанови баланс готівка 5000
-Вихід:
-{{
-  "intent": "balance_setup",
-  "accounts": [
-    {{
-      "name": "Готівка",
-      "balance": 5000,
-      "currency": "{self.default_currency}"
-    }}
-  ]
-}}
-
-Вхід: початкові баланси: готівка 5000, monobank 12000, приват 7000
-Вихід:
-{{
-  "intent": "balance_setup",
-  "accounts": [
-    {{
-      "name": "Готівка",
-      "balance": 5000,
-      "currency": "{self.default_currency}"
-    }},
-    {{
-      "name": "Monobank",
-      "balance": 12000,
-      "currency": "{self.default_currency}"
-    }},
-    {{
-      "name": "Приват",
-      "balance": 7000,
-      "currency": "{self.default_currency}"
-    }}
-  ]
-}}
-
 Повідомлення:
 {user_text}
 """
         parsed = await self._call_claude_json(prompt)
-        normalized = normalize_balance_setup(
+        return normalize_balance_setup(
             parsed,
             default_currency=self.default_currency,
         )
-        return normalized
 
     async def parse_transfer_text(self, user_text: str, account_names: List[str]) -> Dict[str, Any]:
         accounts_text = "\n".join(f"- {name}" for name in account_names)
@@ -510,12 +451,6 @@ class ClaudeParser:
 
 Доступні рахунки:
 {accounts_text}
-
-Твоє завдання:
-- зрозуміти суму
-- вибрати ТОЧНІ назви source_account і destination_account тільки зі списку вище
-- враховувати неточності, скорочення, відмінки, цифри в назвах рахунків
-- не вигадувати нові рахунки
 
 Формат:
 {{
@@ -528,24 +463,9 @@ class ClaudeParser:
 }}
 
 Правила:
+- враховуй неточності, скорочення, відмінки, цифри в назвах рахунків
+- не вигадуй нові рахунки
 - якщо написано "з X на Y", то X це source_account, Y це destination_account
-- якщо написано просто "перевів 2000 з 7097 каті", то 7097 це рахунок-відправник, а Каті це рахунок-отримувач
-- amount має бути числом
-- currency за замовчуванням "{self.default_currency}"
-- description короткий нормальний опис українською
-- source_account і destination_account мають бути тільки з доступного списку
-
-Приклад:
-Вхід: Перевів 2000 грн з 7097 каті
-Вихід:
-{{
-  "intent": "transfer",
-  "amount": 2000,
-  "currency": "{self.default_currency}",
-  "source_account": "Приватбанк 7097",
-  "destination_account": "Приватбанк Катя",
-  "description": "Переказ між рахунками"
-}}
 
 Повідомлення:
 {user_text}
@@ -557,7 +477,7 @@ class ClaudeParser:
         accounts_text = "\n".join(f"- {name}" for name in account_names)
 
         prompt = f"""
-Ти парсер команд для редагування або видалення ОСТАННЬОЇ транзакції.
+Ти парсер команд для редагування або видалення останньої транзакції або її частини.
 Поверни СУВОРО лише JSON без markdown, без пояснень, без трійних лапок.
 
 Доступні asset-рахунки:
@@ -572,17 +492,24 @@ class ClaudeParser:
   "category": "рядок" | null,
   "description": "рядок" | null,
   "source_account": "точна назва зі списку" | null,
-  "destination_account": "точна назва зі списку" | null
+  "destination_account": "точна назва зі списку" | null,
+  "target_index": number | null,
+  "target_category": "рядок" | null,
+  "target_description": "рядок" | null
 }}
 
+Пояснення:
+- action=delete: видалення всієї останньої транзакції або її частини
+- action=update: редагування всієї останньої транзакції або її частини
+- якщо користувач вказує частину чека або частину групової транзакції, поверни selector:
+  - target_index: номер частини, якщо сказано "1 частину", "другу частину" тощо
+  - target_category: якщо вказано категорію частини, наприклад "інше", "напої", "продукти"
+  - target_description: якщо вказано опис частини
+
 Правила:
-- якщо користувач хоче видалити останню транзакцію, став action = "delete"
-- якщо користувач хоче змінити щось в останній транзакції, став action = "update"
 - якщо поле не треба змінювати, повертай null
-- source_account і destination_account можна повертати тільки зі списку вище
+- source_account і destination_account мають бути тільки зі списку
 - враховуй опечатки, скорочення, цифри в назвах рахунків
-- amount має бути числом або null
-- currency за замовчуванням "{self.default_currency}"
 
 Приклади:
 
@@ -596,7 +523,10 @@ class ClaudeParser:
   "category": null,
   "description": null,
   "source_account": null,
-  "destination_account": null
+  "destination_account": null,
+  "target_index": null,
+  "target_category": null,
+  "target_description": null
 }}
 
 Вхід: зміни останню витрату з 200 на 250
@@ -609,39 +539,48 @@ class ClaudeParser:
   "category": null,
   "description": null,
   "source_account": null,
-  "destination_account": null
+  "destination_account": null,
+  "target_index": null,
+  "target_category": null,
+  "target_description": null
 }}
 
-Вхід: зміни категорію останньої транзакції на Пальне
+Вхід: зміни останню витрату "інше" і додай її в цигарки
 Вихід:
 {{
   "intent": "last_transaction_action",
   "action": "update",
   "amount": null,
   "currency": "{self.default_currency}",
-  "category": "Пальне",
+  "category": "Цигарки",
   "description": null,
   "source_account": null,
-  "destination_account": null
+  "destination_account": null,
+  "target_index": null,
+  "target_category": "Інше",
+  "target_description": null
 }}
 
-Вхід: не з готівки, а з Приватбанк 7097
+Вхід: видали з останнього чеку напої
 Вихід:
 {{
   "intent": "last_transaction_action",
-  "action": "update",
+  "action": "delete",
   "amount": null,
   "currency": "{self.default_currency}",
   "category": null,
   "description": null,
-  "source_account": "Приватбанк 7097",
-  "destination_account": null
+  "source_account": null,
+  "destination_account": null,
+  "target_index": null,
+  "target_category": "Напої",
+  "target_description": null
 }}
 
 Повідомлення:
 {user_text}
 """
-        parsed = await self._call_claude_json(prompt)
+        parsed = await self._call_claude_json(prompt, max_tokens=500)
         return normalize_last_transaction_action(parsed, default_currency=self.default_currency)
 
     async def answer_smalltalk(self, user_text: str) -> str:

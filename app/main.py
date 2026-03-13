@@ -187,12 +187,28 @@ def format_last_transaction_action_result(result: dict) -> str:
             f"• Опис: {result.get('old_description')}"
         )
 
+    if action == "deleted_split":
+        return (
+            f"Видалив частину останньої транзакції:\n"
+            f"• Частина: {result.get('target_label')}\n"
+            f"• Сума: {result.get('old_amount', 0):.2f} {currency}\n"
+            f"• Опис: {result.get('old_description')}"
+        )
+
     if action == "updated":
         lines = [
-            "Оновив останню транзакцію:",
-            f"• Було: {result.get('old_amount', 0):.2f} {currency} | {result.get('old_description')}",
-            f"• Стало: {result.get('new_amount', 0):.2f} {currency} | {result.get('new_description')}",
+            "Оновив частину останньої транзакції:" if result.get("target_label") else "Оновив останню транзакцію:",
         ]
+
+        if result.get("target_label"):
+            lines.append(f"• Частина: {result.get('target_label')}")
+
+        lines.extend(
+            [
+                f"• Було: {result.get('old_amount', 0):.2f} {currency} | {result.get('old_description')}",
+                f"• Стало: {result.get('new_amount', 0):.2f} {currency} | {result.get('new_description')}",
+            ]
+        )
 
         if result.get("old_source_account") != result.get("new_source_account"):
             lines.append(
@@ -314,17 +330,13 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
         return {"ok": True, "unauthorized_chat_id": chat_id}
 
     try:
-        if photo:
-            largest_photo = photo[-1]
-            file_id = largest_photo["file_id"]
-            image_bytes, media_type = await get_telegram_file_bytes(file_id)
-            parsed_receipt = await receipt_parser.parse_receipt_image(image_bytes, media_type)
-            await pending_store.set(chat_id, "receipt_confirm", parsed_receipt)
-            await send_telegram_message(chat_id, format_receipt_preview(parsed_receipt))
-            return {"ok": True}
-
         pending = await pending_store.get(chat_id)
+
         if pending and pending.get("kind") == "receipt_confirm":
+            if photo:
+                await send_telegram_message(chat_id, "Спочатку підтвердь або скасуй попередній чек.")
+                return {"ok": True}
+
             if not text:
                 await send_telegram_message(chat_id, "Напиши «підтвердити чек» або «скасувати чек».")
                 return {"ok": True}
@@ -346,6 +358,15 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                 return {"ok": True}
 
             await send_telegram_message(chat_id, "Спочатку підтвердь або скасуй чек.")
+            return {"ok": True}
+
+        if photo:
+            largest_photo = photo[-1]
+            file_id = largest_photo["file_id"]
+            image_bytes, media_type = await get_telegram_file_bytes(file_id)
+            parsed_receipt = await receipt_parser.parse_receipt_image(image_bytes, media_type)
+            await pending_store.set(chat_id, "receipt_confirm", parsed_receipt)
+            await send_telegram_message(chat_id, format_receipt_preview(parsed_receipt))
             return {"ok": True}
 
         if not text:
