@@ -303,20 +303,22 @@ class FireflyClient:
         source_account = receipt.get("source_account") or default_source_account
         currency = receipt.get("currency") or default_currency
         merchant = receipt.get("merchant") or "Чек"
-        groups = receipt.get("category_totals") or []
+        items = receipt.get("items") or []  # ЗМІНЕНО: використовуємо items замість category_totals
         receipt_date = receipt.get("receipt_date") or datetime.now().strftime("%Y-%m-%d")
 
-        if not groups:
-            raise ValueError("У чеку не знайдено категоризованих позицій")
+        if not items:
+            raise ValueError("У чеку не знайдено позицій")
 
         await self.ensure_source_asset_account(source_account, currency)
 
         transactions = []
-        created_groups = []
+        created_items = []
 
-        for group in groups:
-            category = str(group.get("category") or "Інше").strip() or "Інше"
-            amount = round(float(group.get("amount", 0)), 2)
+        # ЗМІНЕНО: створюємо окремий split для КОЖНОЇ позиції чека
+        for item in items:
+            name = str(item.get("name") or "Товар").strip()
+            category = str(item.get("category") or "Інше").strip() or "Інше"
+            amount = round(float(item.get("total_price", 0)), 2)
             if amount <= 0:
                 continue
 
@@ -327,17 +329,17 @@ class FireflyClient:
                     "type": "withdrawal",
                     "date": receipt_date,
                     "amount": str(amount),
-                    "description": f"{merchant} • {category}",
+                    "description": name,  # ЗМІНЕНО: назва товару замість "{merchant} • {category}"
                     "source_name": source_account,
                     "destination_name": category,
                     "currency_code": currency,
                     "category_name": category,
                 }
             )
-            created_groups.append({"category": category, "amount": amount})
+            created_items.append({"name": name, "category": category, "amount": amount})
 
         if not transactions:
-            raise ValueError("Після фільтрації в чеку не залишилося валідних категорій")
+            raise ValueError("Після фільтрації в чеку не залишилося валідних позицій")
 
         payload = {
             "error_if_duplicate_hash": False,
@@ -353,7 +355,7 @@ class FireflyClient:
 
         return {
             "created_count": len(transactions),
-            "groups": created_groups,
+            "items": created_items,  # ЗМІНЕНО: повертаємо items замість groups
             "result": result,
         }
 
@@ -689,6 +691,8 @@ class FireflyClient:
                 "old_description": old_description,
             }
 
+        # Якщо target_idx не вказано і є кілька спілтів - запитуємо уточнення
+        # Якщо спліт один - просто використовуємо його
         if target_idx is None and len(splits) > 1:
             raise ValueError(
                 f"Остання транзакція має кілька частин. Уточни, що саме міняти: {self._list_split_labels(splits)}"

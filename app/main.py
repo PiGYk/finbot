@@ -713,14 +713,16 @@ def format_receipt_preview(receipt: dict, default_currency: str) -> str:
 def format_receipt_commit_result(receipt: dict, result: dict, default_currency: str) -> str:
     merchant = receipt.get("merchant") or "Чек"
     currency = receipt.get("currency") or default_currency
-    groups = result.get("groups", [])
+    items = result.get("items", [])  # ЗМІНЕНО: використовуємо items замість groups
 
-    lines = [f"Чек записав: {merchant}"]
+    lines = [f"✅ Чек записано: {merchant}"]
 
-    if groups:
-        for item in groups:
-            lines.append(f"• {item['category']} — {item['amount']:.2f} {currency}")
-
+    if items:
+        for item in items:
+            # ЗМІНЕНО: показуємо назву товару + категорію + суму
+            lines.append(f"• {item['name']} ({item['category']}) — {item['amount']:.2f} {currency}")
+    
+    lines.append(f"\n📊 Всього позицій: {len(items)}")
     return "\n".join(lines)
 
 
