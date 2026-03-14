@@ -55,12 +55,22 @@ class ReceiptParser:
         model: str,
         default_currency: str,
         category_rules: Optional[CategoryRulesService] = None,
+        provider: str = "claude",  # НОВЕ: claude або openai
+        openai_api_key: Optional[str] = None,  # НОВЕ: для OpenAI
+        openai_model: str = "gpt-4o-mini",  # НОВЕ: модель OpenAI
     ) -> None:
-        self.api_key = api_key
-        self.model = model
+        self.api_key = api_key  # Claude API key
+        self.model = model  # Claude model
         self.default_currency = default_currency
         self.api_url = "https://api.anthropic.com/v1/messages"
         self.category_rules = category_rules
+        
+        # НОВЕ: Підтримка OpenAI
+        self.provider = provider.lower()
+        self.openai_api_key = openai_api_key
+        self.openai_model = openai_model
+        self.openai_api_url = "https://api.openai.com/v1/chat/completions"
+        
         if self.category_rules is not None:
             self.category_rules.ensure_seeded()
 
@@ -223,51 +233,102 @@ class ReceiptParser:
 Якщо чек змішаний → класифікуй КОЖНУ позицію окремо за її типом товару.
 """.strip()
 
-    async def parse_receipt_image(self, image_bytes: bytes, media_type: str) -> Dict[str, Any]:
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        prompt = self._build_prompt()
+    async def _call_openai_vision(self, image_b64: str, prompt: str) -> str:
+        """Викликати OpenAI Vision API для розпізнавання чека."""
         headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
+            "Authorization": f"Bearer {self.openai_api_key}",
+            "Content-Type": "application/json",
         }
         payload = {
-            "model": self.model,
-            "max_tokens": 4000,  # Збільшено для складних/довгих чеків
-            "temperature": 0,  # Строго факти, без вигадок
+            "model": self.openai_model,
             "messages": [
                 {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
                         {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": image_b64,
-                            },
-                        },
-                    ],
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_b64}"
+                            }
+                        }
+                    ]
                 }
             ],
+            "max_tokens": 4000,
+            "temperature": 0,
         }
+        
         async with httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(self.api_url, headers=headers, json=payload)
+            response = await client.post(self.openai_api_url, headers=headers, json=payload)
             if response.status_code >= 400:
-                raise Exception(f"Claude {response.status_code}: {response.text}")
+                raise Exception(f"OpenAI {response.status_code}: {response.text}")
             data = response.json()
+        
+        # Витягти текст з відповіді
+        choices = data.get("choices", [])
+        if not choices:
+            raise ValueError("OpenAI повернув порожню відповідь")
+        
+        message = choices[0].get("message", {})
+        content = message.get("content", "")
+        return content.strip()
 
-        content_blocks = data.get("content", [])
-        if not content_blocks:
-            raise ValueError("Claude повернув порожню відповідь для чека")
+    async def parse_receipt_image(self, image_bytes: bytes, media_type: str) -> Dict[str, Any]:
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        prompt = self._build_prompt()
+        
+        # НОВЕ: Роутинг між Claude і OpenAI
+        if self.provider == "openai":
+            if not self.openai_api_key:
+                raise ValueError("OpenAI API key не налаштований для receipt parsing")
+            
+            raw_text = await self._call_openai_vision(image_b64, prompt)
+            raw_text = strip_code_fences(raw_text)
+        else:
+            # Claude API (за замовчуванням)
+            headers = {
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
+            payload = {
+                "model": self.model,
+                "max_tokens": 4000,
+                "temperature": 0,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": image_b64,
+                                },
+                            },
+                        ],
+                    }
+                ],
+            }
+            async with httpx.AsyncClient(timeout=120) as client:
+                response = await client.post(self.api_url, headers=headers, json=payload)
+                if response.status_code >= 400:
+                    raise Exception(f"Claude {response.status_code}: {response.text}")
+                data = response.json()
 
-        text_parts: List[str] = []
-        for block in content_blocks:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
+            content_blocks = data.get("content", [])
+            if not content_blocks:
+                raise ValueError("Claude повернув порожню відповідь для чека")
 
-        raw_text = strip_code_fences("\n".join(text_parts).strip())
+            text_parts: List[str] = []
+            for block in content_blocks:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+
+            raw_text = strip_code_fences("\n".join(text_parts).strip())
         try:
             parsed = json.loads(raw_text)
         except json.JSONDecodeError as e:

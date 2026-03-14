@@ -48,6 +48,10 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001").strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
+# НОВЕ: Налаштування OCR для чеків
+RECEIPT_OCR_PROVIDER = os.getenv("RECEIPT_OCR_PROVIDER", "claude").strip().lower()  # claude або openai
+RECEIPT_OCR_MODEL_OPENAI = os.getenv("RECEIPT_OCR_MODEL_OPENAI", "gpt-4o-mini").strip()  # gpt-4o-mini, gpt-4o
+
 FIREFLY_BASE_URL = os.getenv("FIREFLY_BASE_URL", "http://firefly:8080").rstrip("/")
 FIREFLY_ACCESS_TOKEN = os.getenv("FIREFLY_ACCESS_TOKEN", "").strip()
 
@@ -330,6 +334,9 @@ def build_profile_runtime(profile: dict[str, Any]) -> ProfileRuntime:
         model=CLAUDE_MODEL,
         default_currency=default_currency,
         category_rules=category_rules,
+        provider=RECEIPT_OCR_PROVIDER,  # НОВЕ: claude або openai
+        openai_api_key=OPENAI_API_KEY,  # НОВЕ: для OpenAI Vision
+        openai_model=RECEIPT_OCR_MODEL_OPENAI,  # НОВЕ: gpt-4o-mini
     )
 
     receipt_enhancer = ReceiptEnhancer(
@@ -428,6 +435,9 @@ def get_default_runtime() -> ProfileRuntime:
         model=CLAUDE_MODEL,
         default_currency=DEFAULT_CURRENCY,
         category_rules=category_rules,
+        provider=RECEIPT_OCR_PROVIDER,  # НОВЕ: claude або openai
+        openai_api_key=OPENAI_API_KEY,  # НОВЕ: для OpenAI Vision
+        openai_model=RECEIPT_OCR_MODEL_OPENAI,  # НОВЕ: gpt-4o-mini
     )
 
     receipt_enhancer = ReceiptEnhancer(
