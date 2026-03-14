@@ -668,6 +668,7 @@ class FireflyClient:
                     "old_amount": old_amount,
                     "currency": old_currency,
                     "old_description": old_description,
+                    "deleted_transaction": last_group,  # НОВЕ: для undo
                 }
 
             target_split = dict(splits[target_idx])

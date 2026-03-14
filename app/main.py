@@ -77,6 +77,7 @@ _bootstrap_lock: Optional[asyncio.Lock] = None
 
 # НОВЕ: Зберігання останніх скасованих операцій для undo
 last_cancelled: dict[int, dict] = {}
+last_deleted_transaction: dict[int, dict] = {}  # Для undo видалених транзакцій
 
 
 @dataclass
@@ -642,10 +643,11 @@ def format_last_transaction_action_result(result: dict, default_currency: str) -
 
     if action == "deleted":
         return (
-            f"Видалив останню транзакцію:\n"
+            f"✅ Видалив останню транзакцію:\n"
             f"• Тип: {result.get('old_type')}\n"
             f"• Сума: {result.get('old_amount', 0):.2f} {currency}\n"
-            f"• Опис: {result.get('old_description')}"
+            f"• Опис: {result.get('old_description')}\n\n"
+            f"💡 Якщо помилково — напиши «поверни назад»"
         )
 
     if action == "deleted_split":
@@ -1140,6 +1142,47 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
 
         # НОВЕ: Обробка команди відновлення останньої скасованої операції (undo)
         if is_undo_text(text):
+            # Спочатку перевіряємо видалені транзакції
+            if chat_id in last_deleted_transaction:
+                deleted_group = last_deleted_transaction.pop(chat_id)
+                
+                # Відновити видалену транзакцію через Firefly API
+                try:
+                    attrs = deleted_group.get("attributes", {})
+                    group_title = attrs.get("group_title") or "Відновлена транзакція"
+                    transactions = attrs.get("transactions", [])
+                    
+                    if transactions:
+                        # Підготувати splits для відновлення
+                        splits = []
+                        for tx in transactions:
+                            splits.append({
+                                "type": tx.get("type"),
+                                "date": tx.get("date"),
+                                "amount": tx.get("amount"),
+                                "description": tx.get("description"),
+                                "source_name": tx.get("source_name"),
+                                "destination_name": tx.get("destination_name"),
+                                "currency_code": tx.get("currency_code"),
+                                "category_name": tx.get("category_name"),
+                            })
+                        
+                        # Створити транзакцію заново
+                        await runtime.firefly._recreate_group(group_title, splits)
+                        
+                        await send_telegram_message(
+                            chat_id,
+                            f"✅ Відновив видалену транзакцію:\n{group_title} — {transactions[0].get('amount')} {transactions[0].get('currency_code')}\n\n💡 Транзакція знову в Firefly."
+                        )
+                    else:
+                        await send_telegram_message(chat_id, "❌ Не вдалось відновити транзакцію (немає даних).")
+                except Exception as e:
+                    logger.error(f"Failed to restore deleted transaction: {e}")
+                    await send_telegram_message(chat_id, f"❌ Помилка при відновленні транзакції: {str(e)}")
+                
+                return {"ok": True}
+            
+            # Потім перевіряємо скасовані чеки
             if chat_id in last_cancelled:
                 # Відновити скасовану операцію назад у pending
                 cancelled_data = last_cancelled.pop(chat_id)
@@ -1158,12 +1201,13 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                         f"✅ Відновив скасовану операцію ({cancelled_data['kind']})."
                     )
                 return {"ok": True}
-            else:
-                await send_telegram_message(
-                    chat_id,
-                    "❌ Немає скасованих операцій для відновлення."
-                )
-                return {"ok": True}
+            
+            # Якщо нічого немає
+            await send_telegram_message(
+                chat_id,
+                "❌ Немає видалених транзакцій або скасованих операцій для відновлення."
+            )
+            return {"ok": True}
 
         if await runtime.claude.looks_like_balance_setup_request(text):
             parsed_setup = await runtime.claude.parse_balance_setup_text(text)
@@ -1282,6 +1326,11 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                 default_currency=runtime.default_currency,
                 default_source_account=runtime.default_source_account,
             )
+            
+            # НОВЕ: Зберегти видалену транзакцію для можливості undo
+            if result.get("action") == "deleted" and "deleted_transaction" in result:
+                last_deleted_transaction[chat_id] = result["deleted_transaction"]
+            
             await send_telegram_message(
                 chat_id,
                 format_last_transaction_action_result(result, runtime.default_currency),
