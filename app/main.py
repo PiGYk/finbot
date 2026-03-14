@@ -1047,6 +1047,13 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
     await ensure_runtime_bootstrapped(runtime)
 
     try:
+        # ФАЗА 4: Перевірити чи користувач у режимі review
+        review_state = review_manager.get_state(chat_id)
+        if review_state:
+            # Користувач у режимі виправлення позицій
+            await _handle_review_mode(chat_id, text, runtime)
+            return {"ok": True}
+        
         pending = await pending_store.get(chat_id)
 
         if pending and pending.get("kind") == "receipt_confirm":
@@ -1475,6 +1482,153 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
 
 
 # ФАЗА 4: Допоміжні функції для режиму review
+
+async def _handle_review_mode(chat_id: int, text: str, runtime):
+    """Обробка дій користувача у режимі review."""
+    state = review_manager.get_state(chat_id)
+    if not state or not text:
+        return
+    
+    text_lower = text.lower().strip()
+    
+    # Дія 1: Прийняти поточну позицію
+    if text_lower in ["✅", "прийняти", "accept", "ok", "да", "так"]:
+        # Позиція не була виправлена, просто перейти до наступної
+        if state.next_suspect():
+            # Показати наступну сумнівну позицію
+            await _show_receipt_item_review(chat_id, state)
+        else:
+            # Закінчити review
+            await _complete_receipt_review(chat_id, state, runtime)
+        return
+    
+    # Дія 2: Виправити назву
+    if text_lower in ["✏️", "виправити назву", "edit name", "edit"]:
+        review_manager.set_mode(chat_id, "edit_name")
+        await send_telegram_message(chat_id, format_receipt_name_input_prompt())
+        return
+    
+    # Дія 3: Змінити категорію
+    if text_lower in ["📁", "змінити категорію", "edit category", "category"]:
+        review_manager.set_mode(chat_id, "edit_category")
+        await send_telegram_message(chat_id, format_receipt_category_selector())
+        return
+    
+    # Дія 4: Далі (без змін)
+    if text_lower in ["⏭️", "далі", "next", "пропустити", "skip"]:
+        if state.next_suspect():
+            await _show_receipt_item_review(chat_id, state)
+        else:
+            await _complete_receipt_review(chat_id, state, runtime)
+        return
+    
+    # Дія 5: Скасувати режим review
+    if text_lower in ["скасувати", "cancel", "выход", "exit"]:
+        review_manager.end_review(chat_id)
+        await send_telegram_message(chat_id, "Режим виправлення скасовано.")
+        return
+    
+    # Обробка вводу для edit_name або edit_category
+    if state.mode == "edit_name":
+        if text_lower == "скасувати":
+            # Повернутися до меню
+            review_manager.set_mode(chat_id, "confirm")
+            await _show_receipt_item_review(chat_id, state)
+            return
+        
+        # Зберегти виправлену назву
+        new_name = text.strip()
+        if len(new_name) > 2 and len(new_name) < 100:
+            # Застосувати виправлення
+            review_manager.apply_current_correction(chat_id, new_name=new_name)
+            
+            # Зберегти в пам'ять
+            item = state.current_item()
+            if item:
+                await runtime.receipt_parser.save_item_confirmation(
+                    merchant=state.receipt_data.get("merchant", "Unknown"),
+                    raw_name=item.get("raw_name", ""),
+                    confirmed_name=new_name,
+                    confirmed_category=item.get("category", "Інше"),
+                    barcode=item.get("barcode"),
+                )
+            
+            # Показати підтвердження
+            item = state.current_item()
+            await send_telegram_message(
+                chat_id,
+                format_correction_saved(
+                    item.get("raw_name", ""),
+                    new_name,
+                    item.get("category", ""),
+                ),
+            )
+            
+            # Перейти до наступної сумнівної позиції
+            review_manager.set_mode(chat_id, "confirm")
+            if state.next_suspect():
+                await _show_receipt_item_review(chat_id, state)
+            else:
+                await _complete_receipt_review(chat_id, state, runtime)
+        else:
+            await send_telegram_message(chat_id, "❌ Назва занадто коротка або довга. Спробуй ще раз.")
+        return
+    
+    if state.mode == "edit_category":
+        # Спроба парсити номер категорії
+        try:
+            cat_number = int(text_lower.split()[0])
+            categories = [
+                "Продукти", "Овочі та фрукти", "Вода", "Солодкі напої", "Алкоголь",
+                "Фастфуд і снеки", "Кафе та ресторани", "Цигарки", "Пальне",
+                "Аптека", "Гігієна та догляд", "Побутова хімія", "Товари для дому",
+                "Тварини", "Інше",
+            ]
+            
+            if 1 <= cat_number <= len(categories):
+                new_category = categories[cat_number - 1]
+                
+                # Застосувати виправлення
+                review_manager.apply_current_correction(chat_id, new_category=new_category)
+                
+                # Зберегти в пам'ять
+                item = state.current_item()
+                if item:
+                    await runtime.receipt_parser.save_item_confirmation(
+                        merchant=state.receipt_data.get("merchant", "Unknown"),
+                        raw_name=item.get("raw_name", ""),
+                        confirmed_name=item.get("normalized_name", item.get("name", "")),
+                        confirmed_category=new_category,
+                        barcode=item.get("barcode"),
+                    )
+                
+                # Показати підтвердження
+                item = state.current_item()
+                await send_telegram_message(
+                    chat_id,
+                    format_correction_saved(
+                        item.get("raw_name", ""),
+                        item.get("normalized_name", item.get("name", "")),
+                        new_category,
+                    ),
+                )
+                
+                # Перейти до наступної
+                review_manager.set_mode(chat_id, "confirm")
+                if state.next_suspect():
+                    await _show_receipt_item_review(chat_id, state)
+                else:
+                    await _complete_receipt_review(chat_id, state, runtime)
+            else:
+                await send_telegram_message(chat_id, f"❌ Виберіть номер від 1 до {len(categories)}.")
+        except (ValueError, IndexError):
+            await send_telegram_message(chat_id, "❌ Введи номер категорії (наприклад, '1' або '5').")
+        return
+    
+    # Якщо ничого не підійшло
+    await send_telegram_message(chat_id, format_receipt_review_menu())
+
+
 async def _show_receipt_item_review(chat_id: int, state):
     """Показати одну позицію для review."""
     item = state.current_item()
@@ -1493,3 +1647,44 @@ async def _show_receipt_item_review(chat_id: int, state):
     msg += "\n\n" + format_receipt_review_menu()
     
     await send_telegram_message(chat_id, msg)
+
+
+async def _complete_receipt_review(chat_id: int, state, runtime):
+    """Завершити режим review і записати чек у Firefly."""
+    # Отримати оновлений чек з виправленнями
+    corrected_receipt = review_manager.end_review(chat_id)
+    
+    if not corrected_receipt:
+        await send_telegram_message(chat_id, "❌ Помилка при завершенні review.")
+        return
+    
+    # Отримати статистику виправлень
+    corrections = state.get_corrections_list()
+    
+    # Записати у Firefly
+    try:
+        result = await runtime.firefly.create_receipt_transactions(
+            receipt=corrected_receipt,
+            default_source_account=runtime.default_source_account,
+            default_currency=runtime.default_currency,
+        )
+        
+        # Очистити pending
+        await pending_store.clear(chat_id)
+        
+        # Показати результат
+        reply = format_review_complete(len(corrections))
+        
+        if corrections:
+            reply += "\n\nВиправлення що були збережені в пам'ять:"
+            for correction in corrections:
+                reply += f"\n• {correction['raw_name']} → {correction['new_name']}"
+        
+        await send_telegram_message(chat_id, reply)
+        
+        logger.info(f"Receipt review completed for {chat_id}: {len(corrections)} corrections saved")
+        
+    except Exception as e:
+        logger.error(f"Error completing receipt review: {str(e)}")
+        await send_telegram_message(chat_id, f"❌ Помилка при записі: {str(e)}")
+
