@@ -594,6 +594,17 @@ def format_last_transaction_action_result(result: dict, default_currency: str) -
     action = result.get("action")
     currency = result.get("currency", default_currency)
 
+    # НОВЕ: обробка видалення кількох транзакцій
+    if action == "deleted_multiple":
+        items = result.get("items", [])
+        count = result.get("count", 0)
+        lines = [f"✅ Видалив {count} останніх транзакцій:"]
+        for i, item in enumerate(items, 1):
+            lines.append(
+                f"{i}. {item.get('description')} — {item.get('amount', 0):.2f} {item.get('currency', currency)}"
+            )
+        return "\n".join(lines)
+
     if action == "deleted":
         return (
             f"Видалив останню транзакцію:\n"

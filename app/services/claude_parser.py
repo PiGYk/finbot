@@ -180,6 +180,18 @@ def normalize_last_transaction_action(parsed: Dict[str, Any], default_currency: 
         target_description = normalize_text(target_description, "")
 
     currency = normalize_text(parsed.get("currency"), default_currency).upper()
+    
+    # НОВЕ: Обробка count (кількість транзакцій для видалення)
+    count = parsed.get("count", 1)
+    if count is not None:
+        try:
+            count = int(count)
+            if count < 1:
+                count = 1
+            if count > 100:  # Обмеження: не більше 100 за раз
+                count = 100
+        except (TypeError, ValueError):
+            count = 1
 
     return {
         "intent": "last_transaction_action",
@@ -193,6 +205,7 @@ def normalize_last_transaction_action(parsed: Dict[str, Any], default_currency: 
         "target_index": target_index,
         "target_category": target_category,
         "target_description": target_description,
+        "count": count,  # НОВЕ
     }
 
 
@@ -868,7 +881,7 @@ class ClaudeParser:
         accounts_text = "\n".join(f"- {name}" for name in account_names)
 
         prompt = f"""
-Ти парсер команд для редагування або видалення останньої транзакції або її частини.
+Ти парсер команд для редагування або видалення останніх транзакцій.
 Поверни СУВОРО лише JSON без markdown, без пояснень, без трійних лапок.
 
 Доступні asset-рахунки:
@@ -878,6 +891,7 @@ class ClaudeParser:
 {{
   "intent": "last_transaction_action",
   "action": "delete" | "update",
+  "count": number (за замовчуванням 1, якщо користувач каже "видали останні 3" - 3),
   "amount": number | null,
   "currency": "{self.default_currency}",
   "category": "рядок" | null,
@@ -888,6 +902,14 @@ class ClaudeParser:
   "target_category": "рядок" | null,
   "target_description": "рядок" | null
 }}
+
+Правила:
+- action: "delete" для видалення, "update" для редагування
+- count: число транзакцій для видалення (1 за замовчуванням)
+  - "видали останню" → count: 1
+  - "видали останні 3" → count: 3
+  - "прибери 2 останніх" → count: 2
+- Якщо користувач говорить про видалення кількох - встанови action="delete" та count=число
 
 Повідомлення:
 {user_text}

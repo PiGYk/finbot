@@ -1,8 +1,11 @@
 import json
+import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
+
+logger = logging.getLogger("finstack")
 
 
 def guess_asset_account_role(name: str) -> str:
@@ -596,6 +599,48 @@ class FireflyClient:
         default_currency: str,
         default_source_account: str,
     ) -> dict:
+        # НОВЕ: підтримка видалення кількох останніх транзакцій
+        count = action_spec.get("count", 1)
+        action = action_spec.get("action", "delete")
+        
+        if action == "delete" and count > 1:
+            # Видалити кілька останніх транзакцій
+            deleted_info = []
+            for i in range(count):
+                try:
+                    last_group = await self.get_last_transaction_group()
+                    group_id = str(last_group.get("id"))
+                    attrs = last_group.get("attributes", {})
+                    group_title = attrs.get("group_title") or "Операція"
+                    splits = self._get_group_splits(last_group)
+                    
+                    if splits:
+                        first = splits[0]
+                        old_amount = abs(parse_float(first.get("amount"), 0.0))
+                        old_currency = first.get("currency_code") or default_currency
+                        old_description = first.get("description") or group_title
+                        
+                        await self.delete_transaction_group(group_id)
+                        
+                        deleted_info.append({
+                            "description": old_description,
+                            "amount": old_amount,
+                            "currency": old_currency,
+                        })
+                except Exception as e:
+                    logger.warning(f"Не вдалось видалити транзакцію #{i+1}: {str(e)}")
+                    break
+            
+            if deleted_info:
+                return {
+                    "action": "deleted_multiple",
+                    "count": len(deleted_info),
+                    "items": deleted_info,
+                }
+            else:
+                raise ValueError(f"Не вдалось видалити {count} транзакцій")
+        
+        # Оригінальна логіка для單 транзакції або редагування
         last_group = await self.get_last_transaction_group()
         group_id = str(last_group.get("id"))
         attrs = last_group.get("attributes", {})
