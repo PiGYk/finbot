@@ -26,6 +26,7 @@ from app.receipt_enhancer import ReceiptEnhancer
 from app.receipt_formatter import format_receipt_detailed
 from app.rate_limiter import claude_limiter, firefly_limiter
 from app.validators import validate_transaction, ValidationError
+from app.services.speech_to_text import SpeechToTextService
 
 load_dotenv()
 
@@ -42,6 +43,8 @@ TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "").strip()
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001").strip()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 FIREFLY_BASE_URL = os.getenv("FIREFLY_BASE_URL", "http://firefly:8080").rstrip("/")
 FIREFLY_ACCESS_TOKEN = os.getenv("FIREFLY_ACCESS_TOKEN", "").strip()
@@ -85,6 +88,7 @@ class ProfileRuntime:
     reminder_service: ReminderService
     budget_service: BudgetService
     receipt_enhancer: ReceiptEnhancer  # НОВЕ
+    speech_to_text: SpeechToTextService  # НОВЕ: розпізнавання голосу
 
 
 def require_env(name: str, value: str) -> None:
@@ -336,6 +340,11 @@ def build_profile_runtime(profile: dict[str, Any]) -> ProfileRuntime:
         file_path=f"{BOT_DATA_ROOT}/budgets_{profile_id}.json",
     )
 
+    speech_to_text = SpeechToTextService(
+        api_key=OPENAI_API_KEY,
+        model="whisper-1",
+    )
+
     return ProfileRuntime(
         profile_id=profile_id,
         title=title,
@@ -348,6 +357,7 @@ def build_profile_runtime(profile: dict[str, Any]) -> ProfileRuntime:
         category_rules=category_rules,
         receipt_parser=receipt_parser,
         receipt_enhancer=receipt_enhancer,  # НОВЕ
+        speech_to_text=speech_to_text,  # НОВЕ: розпізнавання голосу
         reminder_service=reminder_service,
         budget_service=budget_service,
     )
@@ -422,6 +432,11 @@ def get_default_runtime() -> ProfileRuntime:
         file_path=BUDGET_DATA_FILE,
     )
 
+    speech_to_text = SpeechToTextService(
+        api_key=OPENAI_API_KEY,
+        model="whisper-1",
+    )
+
     runtime = ProfileRuntime(
         profile_id="__default__",
         title="Default",
@@ -434,6 +449,7 @@ def get_default_runtime() -> ProfileRuntime:
         category_rules=category_rules,
         receipt_parser=receipt_parser,
         receipt_enhancer=receipt_enhancer,  # НОВЕ
+        speech_to_text=speech_to_text,  # НОВЕ: розпізнавання голосу
         reminder_service=reminder_service,
         budget_service=budget_service,
     )
@@ -876,6 +892,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
     chat_id = chat.get("id")
     text = message.get("text")
     photo = message.get("photo")
+    voice = message.get("voice")  # НОВЕ: розпізнавання голосу
 
     if not chat_id:
         return {"ok": True}
@@ -970,8 +987,46 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             await send_telegram_message(chat_id, receipt_message)
             return {"ok": True}
 
+        # НОВЕ: Обробка голосових повідомлень
+        if voice:
+            file_id = voice.get("file_id")
+            if file_id:
+                logger.debug(f"Processing voice message from {chat_id}")
+                
+                try:
+                    # Завантажити аудіофайл
+                    audio_bytes, _ = await get_telegram_file_bytes(file_id)
+                    
+                    # Розпізнати голос
+                    transcribed_text = await runtime.speech_to_text.transcribe_audio(
+                        audio_bytes,
+                        audio_filename="voice.ogg",
+                        language="uk"
+                    )
+                    
+                    if transcribed_text:
+                        logger.debug(f"✅ Voice transcribed: {transcribed_text[:100]}...")
+                        # Обробити розпізнаний текст як звичайне повідомлення
+                        text = transcribed_text
+                        # Продовжити з обробкою як звичайного тексту (див. нижче)
+                    else:
+                        await send_telegram_message(
+                            chat_id,
+                            "❌ Не зміг розпізнати голос. Спробуй ще раз або напиши текстом."
+                        )
+                        logger.warning(f"Voice transcription failed for {chat_id}")
+                        return {"ok": True}
+                
+                except Exception as e:
+                    logger.error(f"❌ Voice processing error: {repr(e)}")
+                    await send_telegram_message(
+                        chat_id,
+                        f"❌ Помилка при обробці голосу: {str(e)[:100]}"
+                    )
+                    return {"ok": True}
+
         if not text:
-            await send_telegram_message(chat_id, "Поки що я обробляю текстові повідомлення і фото чеків.")
+            await send_telegram_message(chat_id, "Поки що я обробляю текстові повідомлення, фото чеків та голосові повідомлення.")
             return {"ok": True}
 
         # Rate limiting
