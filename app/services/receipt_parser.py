@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from app.services.category_rules import CategoryRulesService
+from app.services.receipt_structure_parser import ReceiptStructureParser  # ФАЗА 2
 
 
 def strip_code_fences(text: str) -> str:
@@ -108,7 +109,37 @@ class ReceiptParser:
         return "Інше"
 
     def _normalize_receipt(self, parsed: Dict[str, Any]) -> Dict[str, Any]:
-        merchant = normalize_text(parsed.get("merchant"), "Чек")
+        # ФАЗА 2: Структурний парсер чека
+        # Спроба детермінувати структуру (товари, totals, service lines, etc.)
+        structure_parser = ReceiptStructureParser()
+        
+        # Будуємо сирі лінійки з items для парсингу структури
+        # (На реальних чеках це були б справді сирі лінійки від OCR)
+        raw_items = parsed.get("items", [])
+        raw_lines_text = "\n".join([
+            normalize_text(item.get("raw_name", item.get("name", "")), "")
+            for item in raw_items
+            if isinstance(item, dict)
+        ])
+        
+        # Парсити структуру
+        try:
+            structured = structure_parser.parse_raw_text(raw_lines_text)
+            structure_warnings = structured.warnings
+        except Exception as e:
+            # Graceful fallback якщо структурний парсер впав
+            structure_warnings = [f"Structure parser error: {str(e)}"]
+            structured = None
+        
+        # Оновити merchant з структурного парсера якщо він кращий
+        vision_merchant = normalize_text(parsed.get("merchant"), "Чек")
+        if structured and structured.merchant_name:
+            # Спроба використовувати merchant з структури якщо він виглядає кращим
+            struct_merchant = structured.merchant_name.strip()
+            if len(struct_merchant) > 2 and len(struct_merchant) < 50:
+                vision_merchant = struct_merchant
+        
+        merchant = vision_merchant
         currency = normalize_text(parsed.get("currency"), self.default_currency).upper()
         receipt_date = normalize_receipt_date(parsed.get("receipt_date"))
         source_account = normalize_text(parsed.get("source_account"), "")
@@ -163,6 +194,27 @@ class ReceiptParser:
 
         category_totals = self._aggregate_category_totals(items)
         receipt_total = round(sum(item["total_price"] for item in items), 2)
+        
+        # ФАЗА 2: Помітити suspect items на основі структури
+        # Якщо item ціна дуже висока (близька до總 суми), ймовірно це помилка
+        if receipt_total > 0:
+            for item in items:
+                price = item["total_price"]
+                price_ratio = price / receipt_total
+                
+                # Якщо позиція становить 80%+ від суми, ймовірно це або:
+                # 1) Сама загальна сума (помилка)
+                # 2) Одна дуже дорога позиція (але рідко)
+                if price_ratio >= 0.75:
+                    item["is_suspect"] = True
+                    item["name_confidence"] = 0.3  # Низька впевненість
+                
+                # Якщо raw_name містить service-like слова, помітити як suspect
+                raw_lower = item.get("raw_name", "").lower()
+                service_keywords = ["касса", "касса", "дата", "чек", "ітого", "всього", "сума", "оплата"]
+                if any(kw in raw_lower for kw in service_keywords):
+                    item["is_suspect"] = True
+                    item["name_confidence"] = 0.2
 
         return {
             "merchant": merchant,
