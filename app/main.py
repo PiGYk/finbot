@@ -25,6 +25,15 @@ from app.logging_config import setup_logging
 from app.receipt_enhancer import ReceiptEnhancer
 from app.receipt_formatter import format_receipt_detailed
 from app.receipt_pipeline_logger import ReceiptPipelineLogger  # ФАЗА 1
+from app.receipt_review_formatter import (  # ФАЗА 4
+    format_receipt_item_review,
+    format_receipt_review_menu,
+    format_receipt_name_input_prompt,
+    format_receipt_category_selector,
+    format_correction_saved,
+    format_review_complete,
+)
+from app.receipt_review_state import review_manager  # ФАЗА 4
 from app.rate_limiter import claude_limiter, firefly_limiter
 from app.validators import validate_transaction, ValidationError
 from app.services.speech_to_text import SpeechToTextService
@@ -1112,6 +1121,27 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             )
             await send_telegram_message(chat_id, receipt_message)
             return {"ok": True}
+        
+        # ФАЗА 4: Режим review (виправлення сумнівних позицій)
+        if text and text.lower().strip() in ["виправити сумнівні", "исправить сомнительные", "fix suspicious"]:
+            pending = await pending_store.get(chat_id)
+            if pending and pending.get("kind") == "receipt_confirm":
+                receipt = pending["payload"]
+                
+                # Запустити режим review
+                state = review_manager.start_review(chat_id, receipt)
+                
+                if state is None:
+                    # Немає сумнівних позицій
+                    await send_telegram_message(chat_id, "Всі позиції виглядають правильно. Немає сумнівних для виправлення.")
+                    return {"ok": True}
+                
+                # Показати першу сумнівну позицію
+                await _show_receipt_item_review(chat_id, state)
+                return {"ok": True}
+            
+            await send_telegram_message(chat_id, "Спочатку надішли фото чека.")
+            return {"ok": True}
 
         # НОВЕ: Обробка голосових повідомлень
         if voice:
@@ -1442,3 +1472,24 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
         await send_telegram_message(chat_id, f"❌ Не зміг обробити повідомлення: {str(e)}")
 
     return {"ok": True}
+
+
+# ФАЗА 4: Допоміжні функції для режиму review
+async def _show_receipt_item_review(chat_id: int, state):
+    """Показати одну позицію для review."""
+    item = state.current_item()
+    if not item:
+        await send_telegram_message(chat_id, "Помилка: не знайду позицію для review.")
+        return
+    
+    msg = format_receipt_item_review(
+        item=item,
+        item_index=state.current_item_index(),
+        total_items=len(state.receipt_data.get('items', [])),
+        total_suspect_items=state.total_suspects(),
+        current_suspect_number=state.current_suspect_number(),
+    )
+    
+    msg += "\n\n" + format_receipt_review_menu()
+    
+    await send_telegram_message(chat_id, msg)
