@@ -297,21 +297,8 @@ def build_profile_runtime(profile: dict[str, Any]) -> ProfileRuntime:
         access_token=firefly_access_token,
     )
 
-    claude = ClaudeParser(
-        api_key=CLAUDE_API_KEY,
-        model=CLAUDE_MODEL,
-        default_currency=default_currency,
-        default_source_account=default_source_account,
-    )
-
     reports = ReportService(
         firefly=firefly,
-        default_currency=default_currency,
-    )
-
-    advisor = AdvisorService(
-        firefly=firefly,
-        claude=claude,
         default_currency=default_currency,
     )
 
@@ -319,6 +306,20 @@ def build_profile_runtime(profile: dict[str, Any]) -> ProfileRuntime:
         file_path=f"{BOT_DATA_ROOT}/category_rules_{profile_id}.json"
     )
     category_rules.ensure_seeded()
+
+    claude = ClaudeParser(
+        api_key=CLAUDE_API_KEY,
+        model=CLAUDE_MODEL,
+        default_currency=default_currency,
+        default_source_account=default_source_account,
+        category_rules=category_rules,  # НОВЕ: передаємо категорії
+    )
+
+    advisor = AdvisorService(
+        firefly=firefly,
+        claude=claude,
+        default_currency=default_currency,
+    )
 
     receipt_parser = ReceiptParser(
         api_key=CLAUDE_API_KEY,
@@ -396,16 +397,20 @@ def get_default_runtime() -> ProfileRuntime:
         access_token=FIREFLY_ACCESS_TOKEN,
     )
 
+    reports = ReportService(
+        firefly=firefly,
+        default_currency=DEFAULT_CURRENCY,
+    )
+
+    category_rules = CategoryRulesService(file_path=CATEGORY_RULES_FILE)
+    category_rules.ensure_seeded()
+
     claude = ClaudeParser(
         api_key=CLAUDE_API_KEY,
         model=CLAUDE_MODEL,
         default_currency=DEFAULT_CURRENCY,
         default_source_account=DEFAULT_SOURCE_ACCOUNT,
-    )
-
-    reports = ReportService(
-        firefly=firefly,
-        default_currency=DEFAULT_CURRENCY,
+        category_rules=category_rules,  # НОВЕ: передаємо категорії
     )
 
     advisor = AdvisorService(
@@ -413,9 +418,6 @@ def get_default_runtime() -> ProfileRuntime:
         claude=claude,
         default_currency=DEFAULT_CURRENCY,
     )
-
-    category_rules = CategoryRulesService(file_path=CATEGORY_RULES_FILE)
-    category_rules.ensure_seeded()
 
     receipt_parser = ReceiptParser(
         api_key=CLAUDE_API_KEY,

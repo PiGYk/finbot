@@ -558,12 +558,13 @@ def normalize_intent(parsed: Dict[str, Any]) -> str:
 
 
 class ClaudeParser:
-    def __init__(self, api_key: str, model: str, default_currency: str, default_source_account: str) -> None:
+    def __init__(self, api_key: str, model: str, default_currency: str, default_source_account: str, category_rules=None) -> None:
         self.api_key = api_key
         self.model = model
         self.default_currency = default_currency
         self.default_source_account = default_source_account
         self.api_url = "https://api.anthropic.com/v1/messages"
+        self.category_rules = category_rules  # НОВЕ: доступ до категорій
         
         # Нове: розумна детекція намірів (замість regex)
         from app.smart_intent_detector import SmartIntentDetector
@@ -793,6 +794,20 @@ class ClaudeParser:
 {accounts_list}
 """
         
+        # НОВЕ: список категорій для кращого розпізнавання
+        categories_hint = ""
+        if self.category_rules:
+            categories_hint = f"""
+Доступні категорії витрат (використовуй ТОЧНУ назву категорії):
+{self.category_rules.render_receipt_category_guide()}
+
+ВАЖЛИВО: Обирай найбільш специфічну категорію!
+- "овочі", "фрукти", "помідори", "яблука" → "Овочі та фрукти"
+- "м'ясо", "молоко", "крупи", "хліб" → "Продукти"
+- "піца", "бургер", "чебуреки", "чіпси" → "Фастфуд і снеки"
+- "кафе", "ресторан", "капучино" → "Кафе та ресторани"
+"""
+        
         prompt = f"""
 Ти парсер коротких фінансових повідомлень українською.
 Поверни СУВОРО лише JSON без markdown, без пояснень, без трійних лапок.
@@ -813,10 +828,12 @@ class ClaudeParser:
 - amount має бути числом
 - якщо користувач поставив мінус, все одно повертай amount додатнім числом
 - currency за замовчуванням "{self.default_currency}"
-- category коротка і людська
+- category: ОБОВ'ЯЗКОВО використовуй ТОЧНУ назву з списку категорій вище (якщо є)
 - description короткий нормальний опис
 - source_account: якщо користувач згадує рахунок (наприклад "приват"), спробуй знайти його у списку {accounts_hint}За замовчуванням "{self.default_source_account}"
 - ВАЖЛИВО: якщо користувач пише "приват" і у списку є "Приватбанк 7097" - використовуй точну назву!
+
+{categories_hint}
 
 Повідомлення:
 {user_text}
