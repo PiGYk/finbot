@@ -75,6 +75,9 @@ _runtime_cache: dict[str, "ProfileRuntime"] = {}
 bootstrapped_runtime_ids: set[str] = set()
 _bootstrap_lock: Optional[asyncio.Lock] = None
 
+# НОВЕ: Зберігання останніх скасованих операцій для undo
+last_cancelled: dict[int, dict] = {}
+
 
 @dataclass
 class ProfileRuntime:
@@ -750,6 +753,22 @@ def is_receipt_cancel_text(text: str) -> bool:
     }
 
 
+def is_undo_text(text: str) -> bool:
+    """Перевірка команди відновлення останньої скасованої операції."""
+    low = text.strip().lower()
+    return low in {
+        "поверни назад",
+        "поверни",
+        "відновити",
+        "відновити чек",
+        "undo",
+        "повернути",
+        "верни",
+        "передумав",
+        "помилка",
+    }
+
+
 async def ensure_default_reminder_loop() -> None:
     global reminder_loop_task
     if reminder_loop_task is None:
@@ -1032,8 +1051,13 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                 return {"ok": True}
 
             if is_receipt_cancel_text(text):
+                # НОВЕ: Зберегти скасований чек для можливості undo
+                last_cancelled[chat_id] = pending.copy()
                 await pending_store.clear(chat_id)
-                await send_telegram_message(chat_id, "Окей, чек скасовано. Нічого не записував.")
+                await send_telegram_message(
+                    chat_id, 
+                    "Окей, чек скасовано. Нічого не записував.\n\n💡 Якщо передумав — напиши «поверни назад»."
+                )
                 return {"ok": True}
 
             await send_telegram_message(chat_id, "Спочатку підтвердь або скасуй чек.")
@@ -1113,6 +1137,33 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             )
             logger.warning(f"Rate limit triggered for chat_id {chat_id}")
             return {"ok": True}
+
+        # НОВЕ: Обробка команди відновлення останньої скасованої операції (undo)
+        if is_undo_text(text):
+            if chat_id in last_cancelled:
+                # Відновити скасовану операцію назад у pending
+                cancelled_data = last_cancelled.pop(chat_id)
+                await pending_store.set(chat_id, cancelled_data["kind"], cancelled_data["payload"])
+                
+                if cancelled_data["kind"] == "receipt_confirm":
+                    receipt = cancelled_data["payload"]
+                    receipt_message = format_receipt_detailed(receipt, show_categories=True)
+                    await send_telegram_message(
+                        chat_id,
+                        f"✅ Відновив чек!\n\n{receipt_message}"
+                    )
+                else:
+                    await send_telegram_message(
+                        chat_id,
+                        f"✅ Відновив скасовану операцію ({cancelled_data['kind']})."
+                    )
+                return {"ok": True}
+            else:
+                await send_telegram_message(
+                    chat_id,
+                    "❌ Немає скасованих операцій для відновлення."
+                )
+                return {"ok": True}
 
         if await runtime.claude.looks_like_balance_setup_request(text):
             parsed_setup = await runtime.claude.parse_balance_setup_text(text)
