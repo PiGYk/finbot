@@ -1060,7 +1060,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             return {"ok": True}
 
         parsed = await runtime.claude.parse_transaction_text(text)
-        parsed["category"] = canonicalize_category(runtime, f"{parsed['description']} {parsed['category']}")
+        parsed["category"] = canonicalize_category(runtime, parsed['category'])
         
         # НОВЕ: Валідація перед записом
         try:
