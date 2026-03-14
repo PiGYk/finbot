@@ -17,6 +17,7 @@ from typing import Dict, Optional
 
 from app.services.receipt_memory import ReceiptMemory
 from app.services.category_rules import CategoryRulesService
+from app.services.merchant_profiles import merchant_registry  # ФАЗА 6
 
 logger = logging.getLogger("finstack")
 
@@ -116,7 +117,20 @@ class ReceiptNormalizer:
                     "source": "barcode_memory",
                 }
         
-        # Крок 3: Dictionary/alias match
+        # ФАЗА 6: Merchant-specific aliases (приоритет над глобальным словарем)
+        merchant_profile = merchant_registry.detect_merchant(merchant)
+        if merchant_profile:
+            merchant_alias_result = self._try_merchant_aliases(raw_name, merchant_profile)
+            if merchant_alias_result:
+                return {
+                    "normalized_name": merchant_alias_result['normalized_name'],
+                    "category": merchant_alias_result.get('category', 'Продукти'),
+                    "normalization_status": "merchant_alias",
+                    "confidence": merchant_alias_result.get('confidence', 0.85),
+                    "source": "merchant_profile",
+                }
+        
+        # Крок 3: Dictionary/alias match (глобальный, приоритет ниже)
         alias_result = self._try_alias_dictionary(raw_name)
         if alias_result:
             return {
@@ -150,9 +164,47 @@ class ReceiptNormalizer:
             "source": "unknown",
         }
     
+    def _try_merchant_aliases(self, raw_name: str, merchant_profile) -> Optional[Dict]:
+        """
+        ФАЗА 6: Спроба знайти скорочення у merchant-specific словнику.
+        
+        Приоритет ВИЩА за глобальний словник.
+        """
+        raw_lower = raw_name.lower().strip()
+        
+        if not merchant_profile.aliases:
+            return None
+        
+        # Точний match
+        if raw_lower in merchant_profile.aliases:
+            return {
+                "normalized_name": merchant_profile.aliases[raw_lower],
+                "confidence": 0.88,  # Трохи вище за глобальний (0.80)
+            }
+        
+        # Точний match на канонічній формі
+        raw_canonical = self._canonicalize(raw_lower)
+        for abbr_key, resolved_name in merchant_profile.aliases.items():
+            abbr_canonical = self._canonicalize(abbr_key)
+            if abbr_canonical == raw_canonical:
+                return {
+                    "normalized_name": resolved_name,
+                    "confidence": 0.88,
+                }
+        
+        # Частинковий match (abbr в рядку)
+        for abbr, resolved_name in merchant_profile.aliases.items():
+            if abbr in raw_lower:
+                return {
+                    "normalized_name": resolved_name,
+                    "confidence": 0.82,  # Трохи нижче за точный (0.88)
+                }
+        
+        return None
+    
     def _try_alias_dictionary(self, raw_name: str) -> Optional[Dict]:
         """
-        Спроба знайти скорочення у словнику.
+        Спроба знайти скорочення у глобальному словнику.
         """
         raw_lower = raw_name.lower().strip()
         
