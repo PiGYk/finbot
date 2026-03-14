@@ -7,6 +7,8 @@ import httpx
 
 from app.services.category_rules import CategoryRulesService
 from app.services.receipt_structure_parser import ReceiptStructureParser  # ФАЗА 2
+from app.services.receipt_memory import ReceiptMemory  # ФАЗА 3
+from app.services.receipt_normalizer import ReceiptNormalizer  # ФАЗА 3
 
 
 def strip_code_fences(text: str) -> str:
@@ -71,6 +73,13 @@ class ReceiptParser:
         self.openai_api_key = openai_api_key
         self.openai_model = openai_model
         self.openai_api_url = "https://api.openai.com/v1/chat/completions"
+        
+        # ФАЗА 3: Пам'ять і нормалізація
+        self.memory = ReceiptMemory()
+        self.normalizer = ReceiptNormalizer(
+            memory=self.memory,
+            category_rules=category_rules
+        )
         
         if self.category_rules is not None:
             self.category_rules.ensure_seeded()
@@ -157,6 +166,7 @@ class ReceiptParser:
             if total_price <= 0:
                 continue
 
+            # Базова категоризація від OCR/AI
             if self.category_rules is not None:
                 category = self.category_rules.resolve_receipt_category(
                     item_name=name,
@@ -167,25 +177,52 @@ class ReceiptParser:
             else:
                 category = self._fallback_category(merchant, name, raw.get("category"))
 
-            # ФАЗА 1: Додати raw_name + confidence
-            # raw_name = те що насправді було на чеку
-            # normalized_name = наша гіпотеза людської назви
-            # normalization_status = звідки взялася гіпотеза ("ocr_only" на цьому етапі)
+            # ФАЗА 1: raw_name tracking
             raw_name = normalize_text(raw.get("raw_name", raw.get("name", "?")), "Товар")
+            
+            # ФАЗА 3: Нормалізація через пам'ять та словники
+            # На цьому етапі просто применяємо нормалізацію до назви від OCR
+            norm_result = self.normalizer.normalize_item(
+                raw_name=raw_name,
+                merchant=merchant,
+                barcode=raw.get("barcode"),
+            )
+            
+            # Використовувати нормалізовану назву якщо вона надійніша ніж OCR
+            if norm_result['normalized_name'] and norm_result['confidence'] >= 0.7:
+                final_name = norm_result['normalized_name']
+                normalization_status = norm_result['normalization_status']
+                name_confidence = norm_result['confidence']
+            else:
+                # Fallback на OCR name якщо нормалізація не впевнена
+                final_name = name
+                normalization_status = norm_result['normalization_status']
+                name_confidence = norm_result['confidence']
+            
+            # Категоризація на основі нормалізованого імені
+            if self.category_rules is not None:
+                final_category = self.category_rules.resolve_receipt_category(
+                    item_name=final_name,
+                    model_category=norm_result.get('category', category),
+                    merchant=merchant,
+                    fallback=category,  # Fallback на OCR category
+                )
+            else:
+                final_category = norm_result.get('category', category)
             
             items.append({
                 # Legacy (для backward compat з старим кодом)
-                "name": name,
+                "name": final_name,
                 "total_price": total_price,
-                "category": category,
+                "category": final_category,
                 
                 # НОВЕ: Структура для нової архітектури
                 "raw_name": raw_name,
-                "normalized_name": name,  # На цьому етапі = name (від OCR)
-                "normalization_status": "ocr_only",  # Статус нормалізації
-                "name_confidence": 0.0,  # Буде заповнено нормалізатором (Phase 3)
+                "normalized_name": final_name,  # Після нормалізації (Phase 3)
+                "normalization_status": normalization_status,  # Статус нормалізації
+                "name_confidence": name_confidence,  # Впевненість от нормалізатора
                 "category_confidence": 0.0,  # Буде заповнено категоризатором
-                "is_suspect": False,  # Буде помічено якщо low confidence (Phase 4)
+                "is_suspect": False,  # Буде помічено якщо low confidence (Phase 2)
                 "barcode": raw.get("barcode"),  # Якщо є в чеку
             })
 
@@ -195,26 +232,25 @@ class ReceiptParser:
         category_totals = self._aggregate_category_totals(items)
         receipt_total = round(sum(item["total_price"] for item in items), 2)
         
-        # ФАЗА 2: Помітити suspect items на основі структури
-        # Якщо item ціна дуже висока (близька до總 суми), ймовірно це помилка
+        # ФАЗА 2-3: Помітити suspect items
         if receipt_total > 0:
             for item in items:
+                # Перевірка 1: Ціна дуже висока (>75% від total)
                 price = item["total_price"]
                 price_ratio = price / receipt_total
-                
-                # Якщо позиція становить 80%+ від суми, ймовірно це або:
-                # 1) Сама загальна сума (помилка)
-                # 2) Одна дуже дорога позиція (але рідко)
                 if price_ratio >= 0.75:
                     item["is_suspect"] = True
-                    item["name_confidence"] = 0.3  # Низька впевненість
                 
-                # Якщо raw_name містить service-like слова, помітити як suspect
+                # Перевірка 2: Service-like слова у raw_name
                 raw_lower = item.get("raw_name", "").lower()
                 service_keywords = ["касса", "касса", "дата", "чек", "ітого", "всього", "сума", "оплата"]
                 if any(kw in raw_lower for kw in service_keywords):
                     item["is_suspect"] = True
-                    item["name_confidence"] = 0.2
+                
+                # Перевірка 3: Низька впевненість нормалізації (Phase 3)
+                name_conf = item.get("name_confidence", 0.0)
+                if name_conf > 0 and name_conf < 0.6:
+                    item["is_suspect"] = True
 
         return {
             "merchant": merchant,
@@ -406,3 +442,25 @@ class ReceiptParser:
         normalized = self._normalize_receipt(parsed)
         print("PARSED_RECEIPT =", json.dumps(normalized, ensure_ascii=False))
         return normalized
+    
+    def save_item_confirmation(
+        self,
+        merchant: str,
+        raw_name: str,
+        confirmed_name: str,
+        confirmed_category: str,
+        barcode: Optional[str] = None
+    ):
+        """
+        Зберегти підтверджену користувачем інформацію про товар.
+        Буде використано для наступних чеків того ж магазину.
+        
+        (Цей метод буде викликатися з Phase 4: User Correction Flow)
+        """
+        self.memory.save_confirmation(
+            merchant=merchant,
+            raw_name=raw_name,
+            normalized_name=confirmed_name,
+            category=confirmed_category,
+            barcode=barcode,
+        )
