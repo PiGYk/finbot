@@ -136,10 +136,26 @@ class ReceiptParser:
             else:
                 category = self._fallback_category(merchant, name, raw.get("category"))
 
+            # ФАЗА 1: Додати raw_name + confidence
+            # raw_name = те що насправді було на чеку
+            # normalized_name = наша гіпотеза людської назви
+            # normalization_status = звідки взялася гіпотеза ("ocr_only" на цьому етапі)
+            raw_name = normalize_text(raw.get("raw_name", raw.get("name", "?")), "Товар")
+            
             items.append({
+                # Legacy (для backward compat з старим кодом)
                 "name": name,
                 "total_price": total_price,
                 "category": category,
+                
+                # НОВЕ: Структура для нової архітектури
+                "raw_name": raw_name,
+                "normalized_name": name,  # На цьому етапі = name (від OCR)
+                "normalization_status": "ocr_only",  # Статус нормалізації
+                "name_confidence": 0.0,  # Буде заповнено нормалізатором (Phase 3)
+                "category_confidence": 0.0,  # Буде заповнено категоризатором
+                "is_suspect": False,  # Буде помічено якщо low confidence (Phase 4)
+                "barcode": raw.get("barcode"),  # Якщо є в чеку
             })
 
         if not items:
@@ -179,6 +195,7 @@ class ReceiptParser:
   "currency": "{self.default_currency}",
   "items": [
     {{
+      "raw_name": "максимально близько до того, що видно на чеку (навіть якщо нечітко)",
       "name": "назва позиції (розшифруй скорочення якщо можливо)",
       "total_price": number,
       "category": "одна з дозволених категорій"

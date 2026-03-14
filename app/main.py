@@ -24,6 +24,7 @@ from app.services.reports import ReportService
 from app.logging_config import setup_logging
 from app.receipt_enhancer import ReceiptEnhancer
 from app.receipt_formatter import format_receipt_detailed
+from app.receipt_pipeline_logger import ReceiptPipelineLogger  # ФАЗА 1
 from app.rate_limiter import claude_limiter, firefly_limiter
 from app.validators import validate_transaction, ValidationError
 from app.services.speech_to_text import SpeechToTextService
@@ -1084,18 +1085,31 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             parsed_receipt = await runtime.receipt_parser.parse_receipt_image(image_bytes, media_type)
             
             # НОВЕ: Покращити категоризацію позицій
-            logger.debug(f"Enhancing receipt categories for {parsed_receipt['merchant']}")
-            enhanced_items = await runtime.receipt_enhancer.enhance_receipt_categories(
-                items=parsed_receipt["items"],
-                merchant=parsed_receipt["merchant"]
-            )
-            parsed_receipt["items"] = enhanced_items
+            # DISABLED: Claude API баланс закончился, OpenAI достаточно для парсинга
+            # logger.debug(f"Enhancing receipt categories for {parsed_receipt['merchant']}")
+            # enhanced_items = await runtime.receipt_enhancer.enhance_receipt_categories(
+            #     items=parsed_receipt["items"],
+            #     merchant=parsed_receipt["merchant"]
+            # )
+            # parsed_receipt["items"] = enhanced_items
+            
+            # ФАЗА 1: Логування обробки чека
+            pipeline_logger = ReceiptPipelineLogger(chat_id, debug_mode=False)
+            pipeline_logger.log_ocr_raw_output({
+                "merchant": parsed_receipt.get("merchant"),
+                "items": parsed_receipt.get("items", []),
+                "receipt_total": parsed_receipt.get("receipt_total"),
+            })
             
             # Зберегти у pending
             await pending_store.set(chat_id, "receipt_confirm", parsed_receipt)
             
-            # НОВЕ: використовувати детальний формат чека
-            receipt_message = format_receipt_detailed(parsed_receipt, show_categories=True)
+            # ФАЗА 1: використовувати детальний формат чека з confidence
+            receipt_message = format_receipt_detailed(
+                parsed_receipt, 
+                show_categories=True,
+                show_confidence=False  # На production = False
+            )
             await send_telegram_message(chat_id, receipt_message)
             return {"ok": True}
 
