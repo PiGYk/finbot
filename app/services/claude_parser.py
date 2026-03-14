@@ -864,12 +864,14 @@ class ClaudeParser:
 Формат:
 {{
   "intent": "transfer",
-  "amount": number,
+  "amount": number (ОБОВ'ЯЗКОВО!),
   "currency": "{self.default_currency}",
   "source_account": "точна назва зі списку",
   "destination_account": "точна назва зі списку",
   "description": "рядок"
 }}
+
+ВАЖЛИВО: amount ОБОВ'ЯЗКОВА! Якщо користувач не вказав суму - вери amount = null, тоді bot запросить уточнення.
 
 Повідомлення:
 {user_text}

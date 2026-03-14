@@ -1081,6 +1081,19 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
         if await runtime.claude.looks_like_transfer_request(text):
             account_names = await runtime.firefly.list_asset_account_names()
             parsed_transfer = await runtime.claude.parse_transfer_text(text, account_names)
+            
+            # НОВЕ: Перевірити чи вказана сума
+            if not parsed_transfer.get("amount") or parsed_transfer["amount"] == 0:
+                await send_telegram_message(
+                    chat_id,
+                    f"❌ Не вказав суму переказу!\n\n"
+                    f"Переказ: {parsed_transfer.get('source_account')} → {parsed_transfer.get('destination_account')}\n\n"
+                    f"Спробуй ще раз з сумою, наприклад:\n"
+                    f"\"переказ 500 з {parsed_transfer.get('source_account')} на {parsed_transfer.get('destination_account')}\""
+                )
+                logger.warning(f"Transfer without amount for {chat_id}: {parsed_transfer}")
+                return {"ok": True}
+            
             await runtime.firefly.create_transfer(parsed_transfer)
             await send_telegram_message(chat_id, format_transfer_result(parsed_transfer))
             return {"ok": True}
