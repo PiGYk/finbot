@@ -1,8 +1,11 @@
 import calendar
 import json
+import logging
 import re
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List
+
+logger = logging.getLogger("finstack")
 
 
 def strip_code_fences(text: str) -> str:
@@ -548,58 +551,25 @@ class ClaudeParser:
         self.default_currency = default_currency
         self.default_source_account = default_source_account
         self.api_url = "https://api.anthropic.com/v1/messages"
+        
+        # Нове: розумна детекція намірів (замість regex)
+        from app.smart_intent_detector import SmartIntentDetector
+        self.intent_detector = SmartIntentDetector(api_key=api_key, model=model)
 
-    def looks_like_balance_setup_request(self, text: str) -> bool:
-        low = text.strip().lower()
-        triggers = [
-            "початкові баланси",
-            "початковий баланс",
-            "стартові баланси",
-            "стартовий баланс",
-            "встанови баланс",
-            "онови баланс",
-            "задати баланс",
-            "зараз на рахунках",
-            "залишки по рахунках",
-        ]
-        return any(trigger in low for trigger in triggers)
+    async def looks_like_balance_setup_request(self, text: str) -> bool:
+        """Розумна детекція запиту на встановлення балансів (замість regex)."""
+        result = await self.intent_detector.detect_intent(text)
+        return result["intent"] == "balance_setup"
 
-    def looks_like_transfer_request(self, text: str) -> bool:
-        low = text.strip().lower()
-        triggers = [
-            "перевів",
-            "перекинув",
-            "переказав",
-            "скинув",
-            "скинула",
-            "перевела",
-            "перевести",
-            "перекинути",
-            "переказ",
-            "між рахунками",
-            "з рахунку",
-            "на рахунок",
-        ]
-        return any(trigger in low for trigger in triggers)
+    async def looks_like_transfer_request(self, text: str) -> bool:
+        """Розумна детекція запиту на переказ між рахунками."""
+        result = await self.intent_detector.detect_intent(text)
+        return result["intent"] == "transfer"
 
-    def looks_like_last_transaction_action_request(self, text: str) -> bool:
-        low = text.strip().lower()
-
-        if low.startswith("не з ") or low.startswith("не на "):
-            return True
-
-        triggers = [
-            "видали остан",
-            "зміни остан",
-            "останню транзакц",
-            "останню витрат",
-            "останній дохід",
-            "останній переказ",
-            "останньої транзакц",
-            "останнього чеку",
-            "в останньому чеку",
-        ]
-        return any(trigger in low for trigger in triggers)
+    async def looks_like_last_transaction_action_request(self, text: str) -> bool:
+        """Розумна детекція запиту на редагування останньої транзакції."""
+        result = await self.intent_detector.detect_intent(text)
+        return result["intent"] == "last_action"
 
     def looks_like_category_create_request(self, text: str) -> bool:
         low = text.strip().lower()
@@ -681,80 +651,102 @@ class ClaudeParser:
         return has_subscription_word and any(action in low for action in actions) and not self.looks_like_subscription_create_request(text)
 
     async def _call_claude_json(self, prompt: str, max_tokens: int = 350) -> Dict[str, Any]:
+        """Викликати Claude JSON з автоматичним retry (exponential backoff)."""
+        from app.claude_retry import retry_with_backoff
         import httpx
+        
+        async def _do_call():
+            headers = {
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
 
-        headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
+            payload = {
+                "model": self.model,
+                "max_tokens": max_tokens,
+                "temperature": 0,
+                "messages": [{"role": "user", "content": prompt}],
+            }
 
-        payload = {
-            "model": self.model,
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "messages": [{"role": "user", "content": prompt}],
-        }
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.post(self.api_url, headers=headers, json=payload)
 
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(self.api_url, headers=headers, json=payload)
+                if response.status_code >= 400:
+                    raise Exception(f"Claude {response.status_code}: {response.text}")
 
-            if response.status_code >= 400:
-                raise Exception(f"Claude {response.status_code}: {response.text}")
+                data = response.json()
 
-            data = response.json()
+            content_blocks = data.get("content", [])
+            if not content_blocks:
+                raise ValueError("Claude повернув порожню відповідь")
 
-        content_blocks = data.get("content", [])
-        if not content_blocks:
-            raise ValueError("Claude повернув порожню відповідь")
+            text_parts: List[str] = []
+            for block in content_blocks:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
 
-        text_parts: List[str] = []
-        for block in content_blocks:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
+            raw_text = "\n".join(text_parts).strip()
+            raw_text = strip_code_fences(raw_text)
 
-        raw_text = "\n".join(text_parts).strip()
-        raw_text = strip_code_fences(raw_text)
-
-        try:
-            return json.loads(raw_text)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Claude повернув не JSON: {raw_text}") from e
+            try:
+                return json.loads(raw_text)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Claude повернув не JSON: {raw_text}") from e
+        
+        # Retry з exponential backoff
+        return await retry_with_backoff(
+            _do_call,
+            max_retries=3,
+            initial_delay=1.0,
+            max_delay=10.0
+        )
 
     async def _call_claude_text(self, prompt: str, max_tokens: int = 500) -> str:
+        """Викликати Claude текст з автоматичним retry."""
+        from app.claude_retry import retry_with_backoff
         import httpx
+        
+        async def _do_call():
+            headers = {
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
 
-        headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
+            payload = {
+                "model": self.model,
+                "max_tokens": max_tokens,
+                "temperature": 0.3,
+                "messages": [{"role": "user", "content": prompt}],
+            }
 
-        payload = {
-            "model": self.model,
-            "max_tokens": max_tokens,
-            "temperature": 0.3,
-            "messages": [{"role": "user", "content": prompt}],
-        }
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.post(self.api_url, headers=headers, json=payload)
 
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(self.api_url, headers=headers, json=payload)
+                if response.status_code >= 400:
+                    raise Exception(f"Claude {response.status_code}: {response.text}")
 
-            if response.status_code >= 400:
-                raise Exception(f"Claude {response.status_code}: {response.text}")
+                data = response.json()
 
-            data = response.json()
+            content_blocks = data.get("content", [])
+            if not content_blocks:
+                raise ValueError("Claude повернув порожню відповідь")
 
-        content_blocks = data.get("content", [])
-        if not content_blocks:
-            raise ValueError("Claude повернув порожню відповідь")
+            text_parts: List[str] = []
+            for block in content_blocks:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
 
-        text_parts: List[str] = []
-        for block in content_blocks:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-
-        return "\n".join(text_parts).strip()
+            return "\n".join(text_parts).strip()
+        
+        # Retry з exponential backoff
+        return await retry_with_backoff(
+            _do_call,
+            max_retries=3,
+            initial_delay=1.0,
+            max_delay=10.0
+        )
 
     async def parse_intent_text(self, user_text: str) -> str:
         prompt = f"""

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 from dataclasses import dataclass
 from threading import Lock
@@ -19,7 +20,20 @@ from app.services.receipt_parser import ReceiptParser
 from app.services.reminder_service import ReminderService
 from app.services.reports import ReportService
 
+# Нові модулі для покращення
+from app.logging_config import setup_logging
+from app.receipt_enhancer import ReceiptEnhancer
+from app.receipt_formatter import format_receipt_detailed
+from app.rate_limiter import claude_limiter, firefly_limiter
+from app.validators import validate_transaction, ValidationError
+
 load_dotenv()
+
+# Налаштування логування
+logger = setup_logging(
+    log_dir=os.getenv("LOG_DIR", "/app/logs"),
+    log_level=os.getenv("LOG_LEVEL", "INFO")
+)
 
 app = FastAPI()
 
@@ -70,6 +84,7 @@ class ProfileRuntime:
     receipt_parser: ReceiptParser
     reminder_service: ReminderService
     budget_service: BudgetService
+    receipt_enhancer: ReceiptEnhancer  # НОВЕ
 
 
 def require_env(name: str, value: str) -> None:
@@ -304,6 +319,11 @@ def build_profile_runtime(profile: dict[str, Any]) -> ProfileRuntime:
         category_rules=category_rules,
     )
 
+    receipt_enhancer = ReceiptEnhancer(
+        api_key=CLAUDE_API_KEY,
+        model=CLAUDE_MODEL,
+    )
+
     reminder_service = ReminderService(
         file_path=f"{BOT_DATA_ROOT}/reminders_{profile_id}.json",
         timezone_name=BOT_TIMEZONE,
@@ -327,6 +347,7 @@ def build_profile_runtime(profile: dict[str, Any]) -> ProfileRuntime:
         advisor=advisor,
         category_rules=category_rules,
         receipt_parser=receipt_parser,
+        receipt_enhancer=receipt_enhancer,  # НОВЕ
         reminder_service=reminder_service,
         budget_service=budget_service,
     )
@@ -384,6 +405,11 @@ def get_default_runtime() -> ProfileRuntime:
         category_rules=category_rules,
     )
 
+    receipt_enhancer = ReceiptEnhancer(
+        api_key=CLAUDE_API_KEY,
+        model=CLAUDE_MODEL,
+    )
+
     reminder_service = ReminderService(
         file_path=REMINDER_DATA_FILE,
         timezone_name=BOT_TIMEZONE,
@@ -407,6 +433,7 @@ def get_default_runtime() -> ProfileRuntime:
         advisor=advisor,
         category_rules=category_rules,
         receipt_parser=receipt_parser,
+        receipt_enhancer=receipt_enhancer,  # НОВЕ
         reminder_service=reminder_service,
         budget_service=budget_service,
     )
@@ -912,19 +939,40 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             largest_photo = photo[-1]
             file_id = largest_photo["file_id"]
             image_bytes, media_type = await get_telegram_file_bytes(file_id)
+            
+            # Парсити чек
             parsed_receipt = await runtime.receipt_parser.parse_receipt_image(image_bytes, media_type)
-            await pending_store.set(chat_id, "receipt_confirm", parsed_receipt)
-            await send_telegram_message(
-                chat_id,
-                format_receipt_preview(parsed_receipt, runtime.default_currency),
+            
+            # НОВЕ: Покращити категоризацію позицій
+            logger.debug(f"Enhancing receipt categories for {parsed_receipt['merchant']}")
+            enhanced_items = await runtime.receipt_enhancer.enhance_receipt_categories(
+                items=parsed_receipt["items"],
+                merchant=parsed_receipt["merchant"]
             )
+            parsed_receipt["items"] = enhanced_items
+            
+            # Зберегти у pending
+            await pending_store.set(chat_id, "receipt_confirm", parsed_receipt)
+            
+            # НОВЕ: використовувати детальний формат чека
+            receipt_message = format_receipt_detailed(parsed_receipt, show_categories=True)
+            await send_telegram_message(chat_id, receipt_message)
             return {"ok": True}
 
         if not text:
             await send_telegram_message(chat_id, "Поки що я обробляю текстові повідомлення і фото чеків.")
             return {"ok": True}
 
-        if runtime.claude.looks_like_balance_setup_request(text):
+        # Rate limiting
+        if not claude_limiter.check_and_wait(chat_id):
+            await send_telegram_message(
+                chat_id,
+                "⚠️ Занадто багато запитів за мінуту. Зачекайте трохи перед наступною командою."
+            )
+            logger.warning(f"Rate limit triggered for chat_id {chat_id}")
+            return {"ok": True}
+
+        if await runtime.claude.looks_like_balance_setup_request(text):
             parsed_setup = await runtime.claude.parse_balance_setup_text(text)
             results = await runtime.firefly.setup_balances(parsed_setup["accounts"])
             await send_telegram_message(chat_id, format_balance_setup_result(results))
@@ -964,14 +1012,14 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             await send_telegram_message(chat_id, runtime.budget_service.format_plan(budget))
             return {"ok": True}
 
-        if runtime.claude.looks_like_transfer_request(text):
+        if await runtime.claude.looks_like_transfer_request(text):
             account_names = await runtime.firefly.list_asset_account_names()
             parsed_transfer = await runtime.claude.parse_transfer_text(text, account_names)
             await runtime.firefly.create_transfer(parsed_transfer)
             await send_telegram_message(chat_id, format_transfer_result(parsed_transfer))
             return {"ok": True}
 
-        if runtime.claude.looks_like_last_transaction_action_request(text):
+        if await runtime.claude.looks_like_last_transaction_action_request(text):
             account_names = await runtime.firefly.list_asset_account_names()
             action_spec = await runtime.claude.parse_last_transaction_action_text(text, account_names)
 
@@ -1013,10 +1061,22 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
 
         parsed = await runtime.claude.parse_transaction_text(text)
         parsed["category"] = canonicalize_category(runtime, f"{parsed['description']} {parsed['category']}")
+        
+        # НОВЕ: Валідація перед записом
+        try:
+            validate_transaction(parsed)
+        except ValidationError as e:
+            logger.warning(f"Validation error for chat_id {chat_id}: {str(e)}")
+            await send_telegram_message(chat_id, f"❌ Помилка: {str(e)}")
+            return {"ok": True}
+        
+        # Записати у Firefly
         await runtime.firefly.create_transaction(parsed)
+        
+        logger.info(f"Transaction recorded: {parsed['type']} {parsed['amount']} {parsed['currency']}")
 
         reply_text = (
-            f"Записав: {parsed['type']} | {parsed['amount']} {parsed['currency']} | "
+            f"✅ Записав: {parsed['type']} | {parsed['amount']} {parsed['currency']} | "
             f"{parsed['category']} | {parsed['description']} | рахунок: {parsed['source_account']}"
         )
 
@@ -1034,7 +1094,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
         await send_telegram_message(chat_id, reply_text)
 
     except Exception as e:
-        print("ERROR =", repr(e))
-        await send_telegram_message(chat_id, f"Не зміг обробити повідомлення: {str(e)}")
+        logger.error(f"Unexpected error in webhook for chat_id {chat_id}: {repr(e)}")
+        await send_telegram_message(chat_id, f"❌ Не зміг обробити повідомлення: {str(e)}")
 
     return {"ok": True}
