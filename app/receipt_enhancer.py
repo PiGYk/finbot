@@ -113,13 +113,14 @@ class ReceiptEnhancer:
             item["category_source"] = "model"
         
         # Якщо все ще є невизначені позиції - питаємо Claude
-        undefined_items = [i for i in items if items[i].get("category_source") == "model"]
+        undefined_items = [item for item in items if item.get("category_source") == "model"]
         if undefined_items:
             enhanced = await self._claude_enhance_categories(undefined_items, merchant)
             for i, enhanced_item in enumerate(enhanced):
-                items[undefined_items[i]]["category"] = enhanced_item["category"]
-                items[undefined_items[i]]["category_confidence"] = "claude"
-                items[undefined_items[i]]["category_source"] = "claude_ai"
+                if i < len(undefined_items):
+                    undefined_items[i]["category"] = enhanced_item["category"]
+                    undefined_items[i]["category_confidence"] = "claude"
+                    undefined_items[i]["category_source"] = "claude_ai"
         
         return items
     
