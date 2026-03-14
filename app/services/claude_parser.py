@@ -770,7 +770,16 @@ class ClaudeParser:
         parsed = await self._call_claude_json(prompt, max_tokens=80)
         return normalize_intent(parsed)
 
-    async def parse_transaction_text(self, user_text: str) -> Dict[str, Any]:
+    async def parse_transaction_text(self, user_text: str, account_names: List[str] = None) -> Dict[str, Any]:
+        # Якщо список рахунків не передано, використовувати дефолт
+        accounts_hint = ""
+        if account_names:
+            accounts_list = "\n".join(f"- {name}" for name in account_names)
+            accounts_hint = f"""
+Доступні рахунки (якщо користувач згадує один з них - використовуй точну назву):
+{accounts_list}
+"""
+        
         prompt = f"""
 Ти парсер коротких фінансових повідомлень українською.
 Поверни СУВОРО лише JSON без markdown, без пояснень, без трійних лапок.
@@ -782,7 +791,7 @@ class ClaudeParser:
   "currency": "{self.default_currency}",
   "category": "рядок",
   "description": "рядок",
-  "source_account": "{self.default_source_account}"
+  "source_account": "назва рахунку або за замовчуванням {self.default_source_account}"
 }}
 
 Правила:
@@ -793,7 +802,8 @@ class ClaudeParser:
 - currency за замовчуванням "{self.default_currency}"
 - category коротка і людська
 - description короткий нормальний опис
-- source_account за замовчуванням "{self.default_source_account}"
+- source_account: якщо користувач згадує рахунок (наприклад "приват"), спробуй знайти його у списку {accounts_hint}За замовчуванням "{self.default_source_account}"
+- ВАЖЛИВО: якщо користувач пише "приват" і у списку є "Приватбанк 7097" - використовуй точну назву!
 
 Повідомлення:
 {user_text}

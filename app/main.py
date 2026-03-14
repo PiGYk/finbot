@@ -1059,7 +1059,9 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             await send_telegram_message(chat_id, advice_reply)
             return {"ok": True}
 
-        parsed = await runtime.claude.parse_transaction_text(text)
+        # Отримати список існуючих рахунків для більш точного розпізнавання
+        account_names = await runtime.firefly.list_asset_account_names()
+        parsed = await runtime.claude.parse_transaction_text(text, account_names=account_names)
         parsed["category"] = canonicalize_category(runtime, parsed['category'])
         
         # НОВЕ: Валідація перед записом
