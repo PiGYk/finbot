@@ -123,7 +123,20 @@ class FireflyClient:
         }
 
         print("CREATE_ASSET_ACCOUNT_PAYLOAD =", json.dumps(payload, ensure_ascii=False))
-        return await self.request("POST", "/api/v1/accounts", json_payload=payload)
+        
+        try:
+            return await self.request("POST", "/api/v1/accounts", json_payload=payload)
+        except Exception as e:
+            error_str = str(e).lower()
+            # Якщо помилка про дублікат - спробувати знайти існуючий рахунок
+            if "422" in str(e) and ("вже" in error_str or "duplicate" in error_str or "already" in error_str):
+                print(f"⚠️ Рахунок '{name}' вже існує, пошук існуючого...")
+                found = await self.find_asset_account_by_name(name)
+                if found:
+                    print(f"✅ Знайшов існуючий рахунок: {name}")
+                    return found
+            # Якщо не дублікат або не знайшли - викинути помилку
+            raise
 
     async def ensure_source_asset_account(self, name: str, currency_code: str) -> dict:
         found = await self.find_asset_account_by_name(name)
