@@ -58,6 +58,7 @@ ALLOWED_CHAT_IDS_RAW = os.getenv("ALLOWED_CHAT_IDS", "").strip()
 CATEGORY_RULES_FILE = os.getenv("CATEGORY_RULES_FILE", "/app/data/category_rules.json").strip()
 REMINDER_DATA_FILE = os.getenv("REMINDER_DATA_FILE", "/app/data/reminders.json").strip()
 BUDGET_DATA_FILE = os.getenv("BUDGET_DATA_FILE", "/app/data/budgets.json").strip()
+RECURRING_TRANSFERS_FILE = os.getenv("RECURRING_TRANSFERS_FILE", "/app/data/recurring_transfers.json").strip()
 BOT_TIMEZONE = os.getenv("BOT_TIMEZONE", "Europe/Kyiv").strip()
 REMINDER_POLL_SECONDS = int(os.getenv("REMINDER_POLL_SECONDS", "30").strip())
 
@@ -91,6 +92,7 @@ class ProfileRuntime:
     budget_service: BudgetService
     receipt_enhancer: ReceiptEnhancer  # НОВЕ
     speech_to_text: SpeechToTextService  # НОВЕ: розпізнавання голосу
+    recurring_transfers: RecurringTransfersService  # НОВЕ: регулярні перекази
 
 
 def require_env(name: str, value: str) -> None:
@@ -347,6 +349,10 @@ def build_profile_runtime(profile: dict[str, Any]) -> ProfileRuntime:
         model="whisper-1",
     )
 
+    recurring_transfers = RecurringTransfersService(
+        file_path=f"{BOT_DATA_ROOT}/recurring_transfers_{profile_id}.json",
+    )
+
     return ProfileRuntime(
         profile_id=profile_id,
         title=title,
@@ -360,6 +366,7 @@ def build_profile_runtime(profile: dict[str, Any]) -> ProfileRuntime:
         receipt_parser=receipt_parser,
         receipt_enhancer=receipt_enhancer,  # НОВЕ
         speech_to_text=speech_to_text,  # НОВЕ: розпізнавання голосу
+        recurring_transfers=recurring_transfers,  # НОВЕ: регулярні перекази
         reminder_service=reminder_service,
         budget_service=budget_service,
     )
@@ -439,6 +446,10 @@ def get_default_runtime() -> ProfileRuntime:
         model="whisper-1",
     )
 
+    recurring_transfers = RecurringTransfersService(
+        file_path=RECURRING_TRANSFERS_FILE,
+    )
+
     runtime = ProfileRuntime(
         profile_id="__default__",
         title="Default",
@@ -452,6 +463,7 @@ def get_default_runtime() -> ProfileRuntime:
         receipt_parser=receipt_parser,
         receipt_enhancer=receipt_enhancer,  # НОВЕ
         speech_to_text=speech_to_text,  # НОВЕ: розпізнавання голосу
+        recurring_transfers=recurring_transfers,  # НОВЕ: регулярні перекази
         reminder_service=reminder_service,
         budget_service=budget_service,
     )
@@ -742,6 +754,35 @@ async def ensure_default_reminder_loop() -> None:
         reminder_loop_task = asyncio.create_task(
             runtime.reminder_service.run_forever(send_telegram_message)
         )
+        
+        # НОВЕ: Запустити цикл регулярних переказів для default профіля
+        default_recurring_task_id = "__default___recurring"
+        if default_recurring_task_id not in profile_reminder_tasks:
+            
+            async def default_recurring_callback(transfer: dict) -> None:
+                """Callback для default профіля."""
+                try:
+                    # Повідомити першому користувачу з default профілем
+                    for chat_id, bound_profile in bound_profiles.items():
+                        if bound_profile == "__default__":
+                            await send_telegram_message(
+                                chat_id,
+                                f"✅ Регулярний переказ виконаний!\n\n"
+                                f"Від: {transfer['source_account']}\n"
+                                f"На: {transfer['destination_account']}\n"
+                                f"Сума: {transfer['amount']} {transfer['currency']}"
+                            )
+                            break
+                except Exception as e:
+                    logger.error(f"Error in default recurring transfer callback: {repr(e)}")
+            
+            profile_reminder_tasks[default_recurring_task_id] = asyncio.create_task(
+                runtime.recurring_transfers.run_forever(
+                    firefly_client=runtime.firefly,
+                    on_transfer_executed=default_recurring_callback,
+                    poll_seconds=60,
+                )
+            )
 
 
 async def ensure_profile_reminder_loop(profile_id: str) -> None:
@@ -753,6 +794,35 @@ async def ensure_profile_reminder_loop(profile_id: str) -> None:
     profile_reminder_tasks[profile_id] = asyncio.create_task(
         runtime.reminder_service.run_forever(send_telegram_message)
     )
+    
+    # НОВЕ: Запустити цикл регулярних переказів
+    profile_recurring_task_id = f"{profile_id}_recurring"
+    if profile_recurring_task_id not in profile_reminder_tasks:
+        
+        async def recurring_transfer_callback(transfer: dict) -> None:
+            """Callback для уведомлення про виконаний регулярний переказ."""
+            try:
+                # Знайти хоча б одного користувача для цього профіля
+                for chat_id, bound_profile in bound_profiles.items():
+                    if bound_profile == profile_id:
+                        await send_telegram_message(
+                            chat_id,
+                            f"✅ Регулярний переказ виконаний!\n\n"
+                            f"Від: {transfer['source_account']}\n"
+                            f"На: {transfer['destination_account']}\n"
+                            f"Сума: {transfer['amount']} {transfer['currency']}"
+                        )
+                        break
+            except Exception as e:
+                logger.error(f"Error in recurring transfer callback: {repr(e)}")
+        
+        profile_reminder_tasks[profile_recurring_task_id] = asyncio.create_task(
+            runtime.recurring_transfers.run_forever(
+                firefly_client=runtime.firefly,
+                on_transfer_executed=recurring_transfer_callback,
+                poll_seconds=60,
+            )
+        )
 
 
 async def send_profile_picker(chat_id: int) -> None:
@@ -1080,6 +1150,51 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             await send_telegram_message(chat_id, runtime.budget_service.format_plan(budget))
             return {"ok": True}
 
+        # НОВЕ: Перевірити чи це регулярний переказ
+        if any(word in text.lower() for word in ["регулярно", "щодня", "щотижня", "щомісячно", "кожен день", "кожен тиждень", "кожен місяць", "daily", "weekly", "monthly", "назавжди"]):
+            account_names = await runtime.firefly.list_asset_account_names()
+            parsed_transfer = await runtime.claude.parse_transfer_text(text, account_names)
+            frequency, time_of_day = parse_frequency_and_time(text)
+            
+            if parsed_transfer.get("amount") and frequency and time_of_day:
+                # Створити регулярний переказ
+                transfer_id = f"{parsed_transfer['source_account']}_{parsed_transfer['destination_account']}_{frequency}_{time_of_day}"
+                try:
+                    config = runtime.recurring_transfers.create(
+                        transfer_id=transfer_id,
+                        source_account=parsed_transfer["source_account"],
+                        destination_account=parsed_transfer["destination_account"],
+                        amount=parsed_transfer["amount"],
+                        currency=parsed_transfer["currency"],
+                        frequency=frequency,
+                        time_of_day=time_of_day,
+                        description=parsed_transfer.get("description", "Регулярний переказ"),
+                    )
+                    
+                    await send_telegram_message(
+                        chat_id,
+                        f"✅ Створено регулярний переказ!\n\n"
+                        f"Від: {config['source_account']}\n"
+                        f"На: {config['destination_account']}\n"
+                        f"Сума: {config['amount']} {config['currency']}\n"
+                        f"Частота: {config['frequency']}\n"
+                        f"Час: {config['time_of_day']}\n"
+                        f"Статус: Активно ✅"
+                    )
+                    return {"ok": True}
+                except Exception as e:
+                    logger.error(f"Error creating recurring transfer: {repr(e)}")
+                    await send_telegram_message(chat_id, f"❌ Помилка: {str(e)}")
+                    return {"ok": True}
+            else:
+                if not parsed_transfer.get("amount"):
+                    await send_telegram_message(chat_id, "❌ Не вказав суму переказу!")
+                if not frequency:
+                    await send_telegram_message(chat_id, "❌ Не розпізнав частоту (щодня/щотижня/щомісячно)")
+                if not time_of_day:
+                    await send_telegram_message(chat_id, "❌ Не розпізнав час (наприклад: о 8 ранку)")
+                return {"ok": True}
+
         if await runtime.claude.looks_like_transfer_request(text):
             account_names = await runtime.firefly.list_asset_account_names()
             parsed_transfer = await runtime.claude.parse_transfer_text(text, account_names)
@@ -1116,6 +1231,24 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                 chat_id,
                 format_last_transaction_action_result(result, runtime.default_currency),
             )
+            return {"ok": True}
+
+        # НОВЕ: Команди для управління регулярними перекасами
+        if text.lower() in {"мої регулярні", "список регулярних", "/recurring", "регулярні перекази"}:
+            active = runtime.recurring_transfers.list_active()
+            if not active:
+                await send_telegram_message(chat_id, "Немає активних регулярних переказів. Напиши наприклад:\n\"переказ 500 щодня о 8 ранку з готівки на приватбанк\"")
+                return {"ok": True}
+            
+            lines = ["📋 Активні регулярні перекази:\n"]
+            for i, t in enumerate(active, 1):
+                lines.append(
+                    f"{i}. {t['source_account']} → {t['destination_account']}\n"
+                    f"   Сума: {t['amount']} {t['currency']}\n"
+                    f"   Частота: {t['frequency']} о {t['time_of_day']}\n"
+                )
+            
+            await send_telegram_message(chat_id, "".join(lines))
             return {"ok": True}
 
         intent = await runtime.claude.parse_intent_text(text)

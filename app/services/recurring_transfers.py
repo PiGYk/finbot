@@ -1,8 +1,9 @@
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable
 
 logger = logging.getLogger("finstack")
 
@@ -200,6 +201,66 @@ class RecurringTransfersService:
                 due.append(transfer)
         
         return due
+
+
+    async def run_forever(
+        self,
+        firefly_client: Any,  # FireflyClient
+        on_transfer_executed: Optional[Callable] = None,
+        poll_seconds: int = 60,
+    ) -> None:
+        """
+        Запустити цикл виконання регулярних переказів.
+        
+        Args:
+            firefly_client: FireflyClient для виконання переказів
+            on_transfer_executed: callback для кожного виконаного переказу
+            poll_seconds: інтервал перевірки (сек)
+        """
+        logger.info("🔄 Запуск цикла регулярних переказів...")
+        
+        while True:
+            try:
+                # Отримати перекази які потрібно виконати
+                due_transfers = self.get_due_transfers()
+                
+                for transfer in due_transfers:
+                    try:
+                        logger.info(
+                            f"▶️ Виконання регулярного переказу: "
+                            f"{transfer['source_account']} → {transfer['destination_account']} "
+                            f"{transfer['amount']} {transfer['currency']}"
+                        )
+                        
+                        # Створити переказ у Firefly
+                        result = await firefly_client.create_transfer({
+                            "amount": transfer["amount"],
+                            "currency": transfer["currency"],
+                            "source_account": transfer["source_account"],
+                            "destination_account": transfer["destination_account"],
+                            "description": transfer["description"],
+                        })
+                        
+                        # Позначити як виконаний
+                        self.mark_executed(transfer["id"])
+                        
+                        logger.info(f"✅ Регулярний переказ виконаний: {transfer['id']}")
+                        
+                        # Callback якщо вказаний
+                        if on_transfer_executed:
+                            await on_transfer_executed(transfer)
+                    
+                    except Exception as e:
+                        logger.error(
+                            f"❌ Помилка при виконанні регулярного переказу {transfer['id']}: {repr(e)}"
+                        )
+                
+                # Чекати перед наступною перевіркою
+                await asyncio.sleep(poll_seconds)
+            
+            except Exception as e:
+                logger.error(f"❌ Помилка в цикла регулярних переказів: {repr(e)}")
+                await asyncio.sleep(poll_seconds)
 
 
 __all__ = ["RecurringTransfersService"]
