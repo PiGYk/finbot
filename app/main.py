@@ -39,6 +39,7 @@ from app.validators import validate_transaction, ValidationError
 from app.services.speech_to_text import SpeechToTextService
 from app.services.recurring_transfers import RecurringTransfersService
 from app.services.recurring_parser import parse_frequency_and_time
+from app.services.list_parser import list_parser  # ФАЗА 7: List recognition
 
 load_dotenv()
 
@@ -1097,7 +1098,13 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             file_id = largest_photo["file_id"]
             image_bytes, media_type = await get_telegram_file_bytes(file_id)
             
-            # Парсити чек
+            # ФАЗА 7: Спочатку пробуємо парсити як СПИСОК
+            # (списки часто чіткіші ніж касові чеки)
+            # parsed_list = await list_parser.parse_list_image_async(image_bytes, media_type)
+            # TODO: Додати Vision detection для списків
+            # На дан момент фокусуємось на касових чеках
+            
+            # Парсити як касовий чек
             parsed_receipt = await runtime.receipt_parser.parse_receipt_image(image_bytes, media_type)
             
             # НОВЕ: Покращити категоризацію позицій

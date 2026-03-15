@@ -435,3 +435,16 @@ class ReceiptParser:
             category=confirmed_category,
             barcode=barcode,
         )
+    
+    def detect_document_type(self, raw_text: str) -> str:
+        """
+        ФАЗА 7: Детектувати тип документа.
+        
+        Returns: "receipt" або "list"
+        """
+        from app.services.list_parser import list_parser
+        
+        if list_parser.is_list_format(raw_text):
+            return "list"
+        
+        return "receipt"
