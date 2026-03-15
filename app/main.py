@@ -19,6 +19,7 @@ from app.services.pending_store import PendingStore
 from app.services.receipt_parser import ReceiptParser
 from app.services.reminder_service import ReminderService
 from app.services.reports import ReportService
+from app.user_preferences import user_preferences  # Обраний рахунок
 
 # Нові модулі для покращення
 from app.logging_config import setup_logging
@@ -658,7 +659,7 @@ def format_last_transaction_action_result(result: dict, default_currency: str) -
         lines = [f"✅ Видалив {count} останніх транзакцій:"]
         for i, item in enumerate(items, 1):
             lines.append(
-                f"{i}. {item.get('description')} — {item.get('amount', 0):.2f} {item.get('currency', currency)}"
+                f"{i}. {item.get('description')} - {item.get('amount', 0):.2f} {item.get('currency', currency)}"
             )
         return "\n".join(lines)
 
@@ -668,7 +669,7 @@ def format_last_transaction_action_result(result: dict, default_currency: str) -
             f"• Тип: {result.get('old_type')}\n"
             f"• Сума: {result.get('old_amount', 0):.2f} {currency}\n"
             f"• Опис: {result.get('old_description')}\n\n"
-            f"💡 Якщо помилково — напиши «поверни назад»"
+            f"💡 Якщо помилково - напиши «поверни назад»"
         )
 
     if action == "deleted_split":
@@ -728,7 +729,7 @@ def format_receipt_preview(receipt: dict, default_currency: str) -> str:
     if groups:
         lines.append("Попередній розподіл:")
         for item in groups:
-            lines.append(f"• {item['category']} — {item['amount']:.2f} {currency}")
+            lines.append(f"• {item['category']} - {item['amount']:.2f} {currency}")
 
     lines.append("")
     lines.append("Напиши: «підтвердити чек» або «скасувати чек».")
@@ -746,8 +747,8 @@ def format_receipt_commit_result(receipt: dict, result: dict, default_currency: 
     if items:
         for item in items:
             # ЗМІНЕНО: показуємо назву товару + категорію + суму
-            lines.append(f"• {item['name']} ({item['category']}) — {item['amount']:.2f} {currency}")
-    
+            lines.append(f"• {item['name']} ({item['category']}) - {item['amount']:.2f} {currency}")
+
     lines.append(f"\n📊 Всього позицій: {len(items)}")
     return "\n".join(lines)
 
@@ -800,11 +801,11 @@ async def ensure_default_reminder_loop() -> None:
         reminder_loop_task = asyncio.create_task(
             runtime.reminder_service.run_forever(send_telegram_message)
         )
-        
+
         # НОВЕ: Запустити цикл регулярних переказів для default профіля
         default_recurring_task_id = "__default___recurring"
         if default_recurring_task_id not in profile_reminder_tasks:
-            
+
             async def default_recurring_callback(transfer: dict) -> None:
                 """Callback для default профіля."""
                 try:
@@ -821,7 +822,7 @@ async def ensure_default_reminder_loop() -> None:
                             break
                 except Exception as e:
                     logger.error(f"Error in default recurring transfer callback: {repr(e)}")
-            
+
             profile_reminder_tasks[default_recurring_task_id] = asyncio.create_task(
                 runtime.recurring_transfers.run_forever(
                     firefly_client=runtime.firefly,
@@ -840,11 +841,11 @@ async def ensure_profile_reminder_loop(profile_id: str) -> None:
     profile_reminder_tasks[profile_id] = asyncio.create_task(
         runtime.reminder_service.run_forever(send_telegram_message)
     )
-    
+
     # НОВЕ: Запустити цикл регулярних переказів
     profile_recurring_task_id = f"{profile_id}_recurring"
     if profile_recurring_task_id not in profile_reminder_tasks:
-        
+
         async def recurring_transfer_callback(transfer: dict) -> None:
             """Callback для уведомлення про виконаний регулярний переказ."""
             try:
@@ -861,7 +862,7 @@ async def ensure_profile_reminder_loop(profile_id: str) -> None:
                         break
             except Exception as e:
                 logger.error(f"Error in recurring transfer callback: {repr(e)}")
-        
+
         profile_reminder_tasks[profile_recurring_task_id] = asyncio.create_task(
             runtime.recurring_transfers.run_forever(
                 firefly_client=runtime.firefly,
@@ -997,8 +998,23 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                     await edit_telegram_message(
                         chat_id=chat_id,
                         message_id=message_id,
-                        text=f"Не зміг прив’язати профіль: {str(e)}",
+                        text=f"Не зміг прив'язати профіль: {str(e)}",
                     )
+            
+            # НОВЕ: Обробка вибору рахунку
+            if data.startswith("select_account:"):
+                account_id = int(data.split(":", 1)[1])
+                account_name = callback_query.get("message", {}).get("text", "").split('\n')[0]
+                
+                await user_preferences.set_preferred_account(chat_id, account_id)
+                await user_preferences.set_preferred_account_name(chat_id, account_name)
+                
+                await edit_telegram_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=f"✅ Обраний рахунок: {account_name}\n\nТепер всі нові транзакції буде записано на цей рахунок.",
+                )
+                await answer_callback_query(callback_id, f"Рахунок '{account_name}' обраний")
 
             return {"ok": True}
 
@@ -1054,7 +1070,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             # Користувач у режимі виправлення позицій
             await _handle_review_mode(chat_id, text, runtime)
             return {"ok": True}
-        
+
         pending = await pending_store.get(chat_id)
 
         if pending and pending.get("kind") == "receipt_confirm":
@@ -1068,9 +1084,11 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
 
             if is_receipt_confirm_text(text):
                 receipt = pending["payload"]
+                # НОВЕ: Використовувати обраний рахунок якщо є
+                source_account = await _get_user_account(chat_id, runtime)
                 result = await runtime.firefly.create_receipt_transactions(
                     receipt=receipt,
-                    default_source_account=runtime.default_source_account,
+                    default_source_account=source_account,
                     default_currency=runtime.default_currency,
                 )
                 await pending_store.clear(chat_id)
@@ -1085,8 +1103,8 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                 last_cancelled[chat_id] = pending.copy()
                 await pending_store.clear(chat_id)
                 await send_telegram_message(
-                    chat_id, 
-                    "Окей, чек скасовано. Нічого не записував.\n\n💡 Якщо передумав — напиши «поверни назад»."
+                    chat_id,
+                    "Окей, чек скасовано. Нічого не записував.\n\n💡 Якщо передумав - напиши «поверни назад»."
                 )
                 return {"ok": True}
 
@@ -1097,16 +1115,16 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             largest_photo = photo[-1]
             file_id = largest_photo["file_id"]
             image_bytes, media_type = await get_telegram_file_bytes(file_id)
-            
+
             # ФАЗА 7: Спочатку пробуємо парсити як СПИСОК
             # (списки часто чіткіші ніж касові чеки)
             # parsed_list = await list_parser.parse_list_image_async(image_bytes, media_type)
             # TODO: Додати Vision detection для списків
             # На дан момент фокусуємось на касових чеках
-            
+
             # Парсити як касовий чек
             parsed_receipt = await runtime.receipt_parser.parse_receipt_image(image_bytes, media_type)
-            
+
             # НОВЕ: Покращити категоризацію позицій
             # DISABLED: Claude API баланс закончился, OpenAI достаточно для парсинга
             # logger.debug(f"Enhancing receipt categories for {parsed_receipt['merchant']}")
@@ -1115,7 +1133,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             #     merchant=parsed_receipt["merchant"]
             # )
             # parsed_receipt["items"] = enhanced_items
-            
+
             # ФАЗА 1: Логування обробки чека
             pipeline_logger = ReceiptPipelineLogger(chat_id, debug_mode=False)
             pipeline_logger.log_ocr_raw_output({
@@ -1123,37 +1141,42 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                 "items": parsed_receipt.get("items", []),
                 "receipt_total": parsed_receipt.get("receipt_total"),
             })
-            
+
             # Зберегти у pending
             await pending_store.set(chat_id, "receipt_confirm", parsed_receipt)
-            
+
             # ФАЗА 1: використовувати детальний формат чека з confidence
             receipt_message = format_receipt_detailed(
-                parsed_receipt, 
+                parsed_receipt,
                 show_categories=True,
                 show_confidence=False  # На production = False
             )
             await send_telegram_message(chat_id, receipt_message)
             return {"ok": True}
-        
+
+        # НОВЕ: Меню обраних рахунків
+        if text and text.lower().strip() in ["/accounts", "/account", "рахунок", "счет", "account"]:
+            await _show_accounts_menu(chat_id, runtime)
+            return {"ok": True}
+
         # ФАЗА 4: Режим review (виправлення сумнівних позицій)
         if text and text.lower().strip() in ["виправити сумнівні", "исправить сомнительные", "fix suspicious"]:
             pending = await pending_store.get(chat_id)
             if pending and pending.get("kind") == "receipt_confirm":
                 receipt = pending["payload"]
-                
+
                 # Запустити режим review
                 state = review_manager.start_review(chat_id, receipt)
-                
+
                 if state is None:
                     # Немає сумнівних позицій
                     await send_telegram_message(chat_id, "Всі позиції виглядають правильно. Немає сумнівних для виправлення.")
                     return {"ok": True}
-                
+
                 # Показати першу сумнівну позицію
                 await _show_receipt_item_review(chat_id, state)
                 return {"ok": True}
-            
+
             await send_telegram_message(chat_id, "Спочатку надішли фото чека.")
             return {"ok": True}
 
@@ -1162,18 +1185,18 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             file_id = voice.get("file_id")
             if file_id:
                 logger.debug(f"Processing voice message from {chat_id}")
-                
+
                 try:
                     # Завантажити аудіофайл
                     audio_bytes, _ = await get_telegram_file_bytes(file_id)
-                    
+
                     # Розпізнати голос
                     transcribed_text = await runtime.speech_to_text.transcribe_audio(
                         audio_bytes,
                         audio_filename="voice.ogg",
                         language="uk"
                     )
-                    
+
                     if transcribed_text:
                         logger.debug(f"✅ Voice transcribed: {transcribed_text[:100]}...")
                         # Обробити розпізнаний текст як звичайне повідомлення
@@ -1186,7 +1209,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                         )
                         logger.warning(f"Voice transcription failed for {chat_id}")
                         return {"ok": True}
-                
+
                 except Exception as e:
                     logger.error(f"❌ Voice processing error: {repr(e)}")
                     await send_telegram_message(
@@ -1213,13 +1236,13 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             # Спочатку перевіряємо видалені транзакції
             if chat_id in last_deleted_transaction:
                 deleted_group = last_deleted_transaction.pop(chat_id)
-                
+
                 # Відновити видалену транзакцію через Firefly API
                 try:
                     attrs = deleted_group.get("attributes", {})
                     group_title = attrs.get("group_title") or "Відновлена транзакція"
                     transactions = attrs.get("transactions", [])
-                    
+
                     if transactions:
                         # Підготувати splits для відновлення
                         splits = []
@@ -1234,28 +1257,28 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                                 "currency_code": tx.get("currency_code"),
                                 "category_name": tx.get("category_name"),
                             })
-                        
+
                         # Створити транзакцію заново
                         await runtime.firefly._recreate_group(group_title, splits)
-                        
+
                         await send_telegram_message(
                             chat_id,
-                            f"✅ Відновив видалену транзакцію:\n{group_title} — {transactions[0].get('amount')} {transactions[0].get('currency_code')}\n\n💡 Транзакція знову в Firefly."
+                            f"✅ Відновив видалену транзакцію:\n{group_title} - {transactions[0].get('amount')} {transactions[0].get('currency_code')}\n\n💡 Транзакція знову в Firefly."
                         )
                     else:
                         await send_telegram_message(chat_id, "❌ Не вдалось відновити транзакцію (немає даних).")
                 except Exception as e:
                     logger.error(f"Failed to restore deleted transaction: {e}")
                     await send_telegram_message(chat_id, f"❌ Помилка при відновленні транзакції: {str(e)}")
-                
+
                 return {"ok": True}
-            
+
             # Потім перевіряємо скасовані чеки
             if chat_id in last_cancelled:
                 # Відновити скасовану операцію назад у pending
                 cancelled_data = last_cancelled.pop(chat_id)
                 await pending_store.set(chat_id, cancelled_data["kind"], cancelled_data["payload"])
-                
+
                 if cancelled_data["kind"] == "receipt_confirm":
                     receipt = cancelled_data["payload"]
                     receipt_message = format_receipt_detailed(receipt, show_categories=True)
@@ -1269,7 +1292,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                         f"✅ Відновив скасовану операцію ({cancelled_data['kind']})."
                     )
                 return {"ok": True}
-            
+
             # Якщо нічого немає
             await send_telegram_message(
                 chat_id,
@@ -1322,7 +1345,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             account_names = await runtime.firefly.list_asset_account_names()
             parsed_transfer = await runtime.claude.parse_transfer_text(text, account_names)
             frequency, time_of_day = parse_frequency_and_time(text)
-            
+
             if parsed_transfer.get("amount") and frequency and time_of_day:
                 # Створити регулярний переказ
                 transfer_id = f"{parsed_transfer['source_account']}_{parsed_transfer['destination_account']}_{frequency}_{time_of_day}"
@@ -1337,7 +1360,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                         time_of_day=time_of_day,
                         description=parsed_transfer.get("description", "Регулярний переказ"),
                     )
-                    
+
                     await send_telegram_message(
                         chat_id,
                         f"✅ Створено регулярний переказ!\n\n"
@@ -1365,7 +1388,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
         if await runtime.claude.looks_like_transfer_request(text):
             account_names = await runtime.firefly.list_asset_account_names()
             parsed_transfer = await runtime.claude.parse_transfer_text(text, account_names)
-            
+
             # НОВЕ: Перевірити чи вказана сума
             if not parsed_transfer.get("amount") or parsed_transfer["amount"] == 0:
                 await send_telegram_message(
@@ -1377,7 +1400,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                 )
                 logger.warning(f"Transfer without amount for {chat_id}: {parsed_transfer}")
                 return {"ok": True}
-            
+
             await runtime.firefly.create_transfer(parsed_transfer)
             await send_telegram_message(chat_id, format_transfer_result(parsed_transfer))
             return {"ok": True}
@@ -1389,16 +1412,18 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             if action_spec.get("category"):
                 action_spec["category"] = canonicalize_category(runtime, action_spec["category"])
 
+            # НОВЕ: Використовувати обраний рахунок якщо є
+            source_account = await _get_user_account(chat_id, runtime)
             result = await runtime.firefly.apply_last_transaction_action(
                 action_spec=action_spec,
                 default_currency=runtime.default_currency,
-                default_source_account=runtime.default_source_account,
+                default_source_account=source_account,
             )
-            
+
             # НОВЕ: Зберегти видалену транзакцію для можливості undo
             if result.get("action") == "deleted" and "deleted_transaction" in result:
                 last_deleted_transaction[chat_id] = result["deleted_transaction"]
-            
+
             await send_telegram_message(
                 chat_id,
                 format_last_transaction_action_result(result, runtime.default_currency),
@@ -1411,7 +1436,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             if not active:
                 await send_telegram_message(chat_id, "Немає активних регулярних переказів. Напиши наприклад:\n\"переказ 500 щодня о 8 ранку з готівки на приватбанк\"")
                 return {"ok": True}
-            
+
             lines = ["📋 Активні регулярні перекази:\n"]
             for i, t in enumerate(active, 1):
                 lines.append(
@@ -1419,7 +1444,7 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                     f"   Сума: {t['amount']} {t['currency']}\n"
                     f"   Частота: {t['frequency']} о {t['time_of_day']}\n"
                 )
-            
+
             await send_telegram_message(chat_id, "".join(lines))
             return {"ok": True}
 
@@ -1450,6 +1475,11 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
         parsed = await runtime.claude.parse_transaction_text(text, account_names=account_names)
         parsed["category"] = canonicalize_category(runtime, parsed['category'])
         
+        # НОВЕ: Якщо користувач обрав рахунок, використати його
+        user_account = await _get_user_account(chat_id, runtime)
+        if user_account and user_account != runtime.default_source_account:
+            parsed["source_account"] = user_account
+
         # НОВЕ: Валідація перед записом
         try:
             validate_transaction(parsed)
@@ -1457,10 +1487,10 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             logger.warning(f"Validation error for chat_id {chat_id}: {str(e)}")
             await send_telegram_message(chat_id, f"❌ Помилка: {str(e)}")
             return {"ok": True}
-        
+
         # Записати у Firefly
         await runtime.firefly.create_transaction(parsed)
-        
+
         logger.info(f"Transaction recorded: {parsed['type']} {parsed['amount']} {parsed['currency']}")
 
         reply_text = (
@@ -1495,9 +1525,9 @@ async def _handle_review_mode(chat_id: int, text: str, runtime):
     state = review_manager.get_state(chat_id)
     if not state or not text:
         return
-    
+
     text_lower = text.lower().strip()
-    
+
     # Дія 1: Прийняти поточну позицію
     if text_lower in ["✅", "прийняти", "accept", "ok", "да", "так"]:
         # Позиція не була виправлена, просто перейти до наступної
@@ -1508,19 +1538,19 @@ async def _handle_review_mode(chat_id: int, text: str, runtime):
             # Закінчити review
             await _complete_receipt_review(chat_id, state, runtime)
         return
-    
+
     # Дія 2: Виправити назву
     if text_lower in ["✏️", "виправити назву", "edit name", "edit"]:
         review_manager.set_mode(chat_id, "edit_name")
         await send_telegram_message(chat_id, format_receipt_name_input_prompt())
         return
-    
+
     # Дія 3: Змінити категорію
     if text_lower in ["📁", "змінити категорію", "edit category", "category"]:
         review_manager.set_mode(chat_id, "edit_category")
         await send_telegram_message(chat_id, format_receipt_category_selector())
         return
-    
+
     # Дія 4: Далі (без змін)
     if text_lower in ["⏭️", "далі", "next", "пропустити", "skip"]:
         if state.next_suspect():
@@ -1528,13 +1558,13 @@ async def _handle_review_mode(chat_id: int, text: str, runtime):
         else:
             await _complete_receipt_review(chat_id, state, runtime)
         return
-    
+
     # Дія 5: Скасувати режим review
     if text_lower in ["скасувати", "cancel", "выход", "exit"]:
         review_manager.end_review(chat_id)
         await send_telegram_message(chat_id, "Режим виправлення скасовано.")
         return
-    
+
     # Обробка вводу для edit_name або edit_category
     if state.mode == "edit_name":
         if text_lower == "скасувати":
@@ -1542,13 +1572,13 @@ async def _handle_review_mode(chat_id: int, text: str, runtime):
             review_manager.set_mode(chat_id, "confirm")
             await _show_receipt_item_review(chat_id, state)
             return
-        
+
         # Зберегти виправлену назву
         new_name = text.strip()
         if len(new_name) > 2 and len(new_name) < 100:
             # Застосувати виправлення
             review_manager.apply_current_correction(chat_id, new_name=new_name)
-            
+
             # Зберегти в пам'ять
             item = state.current_item()
             if item:
@@ -1559,7 +1589,7 @@ async def _handle_review_mode(chat_id: int, text: str, runtime):
                     confirmed_category=item.get("category", "Інше"),
                     barcode=item.get("barcode"),
                 )
-            
+
             # Показати підтвердження
             item = state.current_item()
             await send_telegram_message(
@@ -1570,7 +1600,7 @@ async def _handle_review_mode(chat_id: int, text: str, runtime):
                     item.get("category", ""),
                 ),
             )
-            
+
             # Перейти до наступної сумнівної позиції
             review_manager.set_mode(chat_id, "confirm")
             if state.next_suspect():
@@ -1580,7 +1610,7 @@ async def _handle_review_mode(chat_id: int, text: str, runtime):
         else:
             await send_telegram_message(chat_id, "❌ Назва занадто коротка або довга. Спробуй ще раз.")
         return
-    
+
     if state.mode == "edit_category":
         # Спроба парсити номер категорії
         try:
@@ -1591,13 +1621,13 @@ async def _handle_review_mode(chat_id: int, text: str, runtime):
                 "Аптека", "Гігієна та догляд", "Побутова хімія", "Товари для дому",
                 "Тварини", "Інше",
             ]
-            
+
             if 1 <= cat_number <= len(categories):
                 new_category = categories[cat_number - 1]
-                
+
                 # Застосувати виправлення
                 review_manager.apply_current_correction(chat_id, new_category=new_category)
-                
+
                 # Зберегти в пам'ять
                 item = state.current_item()
                 if item:
@@ -1608,7 +1638,7 @@ async def _handle_review_mode(chat_id: int, text: str, runtime):
                         confirmed_category=new_category,
                         barcode=item.get("barcode"),
                     )
-                
+
                 # Показати підтвердження
                 item = state.current_item()
                 await send_telegram_message(
@@ -1619,7 +1649,7 @@ async def _handle_review_mode(chat_id: int, text: str, runtime):
                         new_category,
                     ),
                 )
-                
+
                 # Перейти до наступної
                 review_manager.set_mode(chat_id, "confirm")
                 if state.next_suspect():
@@ -1631,7 +1661,7 @@ async def _handle_review_mode(chat_id: int, text: str, runtime):
         except (ValueError, IndexError):
             await send_telegram_message(chat_id, "❌ Введи номер категорії (наприклад, '1' або '5').")
         return
-    
+
     # Якщо ничого не підійшло
     await send_telegram_message(chat_id, format_receipt_review_menu())
 
@@ -1642,7 +1672,7 @@ async def _show_receipt_item_review(chat_id: int, state):
     if not item:
         await send_telegram_message(chat_id, "Помилка: не знайду позицію для review.")
         return
-    
+
     msg = format_receipt_item_review(
         item=item,
         item_index=state.current_item_index(),
@@ -1650,9 +1680,9 @@ async def _show_receipt_item_review(chat_id: int, state):
         total_suspect_items=state.total_suspects(),
         current_suspect_number=state.current_suspect_number(),
     )
-    
+
     msg += "\n\n" + format_receipt_review_menu()
-    
+
     await send_telegram_message(chat_id, msg)
 
 
@@ -1660,38 +1690,118 @@ async def _complete_receipt_review(chat_id: int, state, runtime):
     """Завершити режим review і записати чек у Firefly."""
     # Отримати оновлений чек з виправленнями
     corrected_receipt = review_manager.end_review(chat_id)
-    
+
     if not corrected_receipt:
         await send_telegram_message(chat_id, "❌ Помилка при завершенні review.")
         return
-    
+
     # Отримати статистику виправлень
     corrections = state.get_corrections_list()
-    
+
     # Записати у Firefly
     try:
+        # НОВЕ: Використовувати обраний рахунок якщо є
+        source_account = await _get_user_account(chat_id, runtime)
         result = await runtime.firefly.create_receipt_transactions(
             receipt=corrected_receipt,
-            default_source_account=runtime.default_source_account,
+            default_source_account=source_account,
             default_currency=runtime.default_currency,
         )
-        
+
         # Очистити pending
         await pending_store.clear(chat_id)
-        
+
         # Показати результат
         reply = format_review_complete(len(corrections))
-        
+
         if corrections:
             reply += "\n\nВиправлення що були збережені в пам'ять:"
             for correction in corrections:
                 reply += f"\n• {correction['raw_name']} → {correction['new_name']}"
-        
+
         await send_telegram_message(chat_id, reply)
-        
+
         logger.info(f"Receipt review completed for {chat_id}: {len(corrections)} corrections saved")
-        
+
     except Exception as e:
         logger.error(f"Error completing receipt review: {str(e)}")
         await send_telegram_message(chat_id, f"❌ Помилка при записі: {str(e)}")
+
+
+# ═════════════════════════════════════════════════════════════════
+# НОВЕ: МЕНЮ ОБРАНИХ РАХУНКІВ
+# ═════════════════════════════════════════════════════════════════
+
+async def _get_user_account(chat_id: int, runtime) -> str:
+    """
+    Отримати обраний рахунок користувача або повернутися до дефолтного.
+    """
+    try:
+        preferred_id = await user_preferences.get_preferred_account(chat_id)
+        
+        if preferred_id:
+            # Перевірити що рахунок ще існує
+            accounts = await runtime.firefly.list_asset_accounts()
+            for account in accounts:
+                if account.get("id") == preferred_id:
+                    return str(preferred_id)
+            
+            # Якщо рахунок видален, очистити preference
+            await user_preferences.set_preferred_account(chat_id, None)
+    
+    except Exception as e:
+        logger.warning(f"Error getting user account preference: {str(e)}")
+    
+    # Повернутися до дефолтного
+    return runtime.default_source_account
+
+
+async def _show_accounts_menu(chat_id: int, runtime) -> None:
+    """Показати меню для вибору рахунку."""
+    try:
+        # Отримати список рахунків
+        accounts = await runtime.firefly.list_asset_accounts()
+        
+        if not accounts:
+            await send_telegram_message(chat_id, "❌ Немає доступних рахунків.")
+            return
+        
+        # Отримати поточно обраний рахунок
+        current_account_id = await user_preferences.get_preferred_account(chat_id)
+        current_account_name = await user_preferences.get_preferred_account_name(chat_id)
+        
+        # Побудувати меню
+        text = "💳 **Вибери основний рахунок:**\n\n"
+        
+        if current_account_name:
+            text += f"Поточно обраний: *{current_account_name}*\n\n"
+        
+        buttons = []
+        for account in accounts:
+            account_id = account.get("id")
+            account_name = account.get("name", "Unknown")
+            
+            # Позначити обраний рахунок
+            prefix = "✅ " if account_id == current_account_id else "  "
+            
+            buttons.append({
+                "text": f"{prefix}{account_name}",
+                "callback_data": f"select_account:{account_id}"
+            })
+        
+        #송크Группировать кнопки по 2 в ряду
+        inline_keyboard = []
+        for i in range(0, len(buttons), 2):
+            row = buttons[i:i+2]
+            inline_keyboard.append(row)
+        
+        await send_telegram_message(
+            chat_id,
+            text,
+            reply_markup={"inline_keyboard": inline_keyboard}
+        )
+    
+    except Exception as e:
+        logger.error(f"Error showing accounts menu: {str(e)}")
+        await send_telegram_message(chat_id, f"❌ Помилка при завантаженні рахунків: {str(e)}")
 
