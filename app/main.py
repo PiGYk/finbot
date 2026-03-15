@@ -1003,18 +1003,39 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             
             # НОВЕ: Обробка вибору рахунку
             if data.startswith("select_account:"):
-                account_id = int(data.split(":", 1)[1])
-                account_name = callback_query.get("message", {}).get("text", "").split('\n')[0]
+                account_id_str = data.split(":", 1)[1]
                 
-                await user_preferences.set_preferred_account(chat_id, account_id)
-                await user_preferences.set_preferred_account_name(chat_id, account_name)
+                try:
+                    # Отримати runtime щоб витягти рахунок по ID
+                    runtime_for_account = get_default_runtime() if not profiles_enabled() else get_profile_runtime(get_bound_profile_id(chat_id))
+                    
+                    # Знайти рахунок у списку
+                    accounts = await runtime_for_account.firefly.list_asset_accounts()
+                    account_name = None
+                    
+                    for account in accounts:
+                        if str(account.get("id")) == account_id_str:
+                            account_attrs = account.get("attributes", {})
+                            account_name = account_attrs.get("name", "Невідомий рахунок")
+                            break
+                    
+                    if not account_name:
+                        account_name = f"Рахунок {account_id_str}"
+                    
+                    # Зберегти preference
+                    await user_preferences.set_preferred_account(chat_id, int(account_id_str))
+                    await user_preferences.set_preferred_account_name(chat_id, account_name)
+                    
+                    await edit_telegram_message(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=f"✅ Обраний рахунок: *{account_name}*\n\nТепер всі нові транзакції буде записано на цей рахунок.",
+                    )
+                    await answer_callback_query(callback_id, f"Рахунок '{account_name}' обраний ✅")
                 
-                await edit_telegram_message(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=f"✅ Обраний рахунок: {account_name}\n\nТепер всі нові транзакції буде записано на цей рахунок.",
-                )
-                await answer_callback_query(callback_id, f"Рахунок '{account_name}' обраний")
+                except Exception as e:
+                    logger.error(f"Error selecting account: {str(e)}")
+                    await answer_callback_query(callback_id, f"❌ Помилка: {str(e)}")
 
             return {"ok": True}
 
@@ -1743,7 +1764,8 @@ async def _get_user_account(chat_id: int, runtime) -> str:
             # Перевірити що рахунок ще існує
             accounts = await runtime.firefly.list_asset_accounts()
             for account in accounts:
-                if account.get("id") == preferred_id:
+                # Porівняти як strings (API може повертати int або string)
+                if str(account.get("id")) == str(preferred_id):
                     return str(preferred_id)
             
             # Якщо рахунок видален, очистити preference
@@ -1766,6 +1788,8 @@ async def _show_accounts_menu(chat_id: int, runtime) -> None:
             await send_telegram_message(chat_id, "❌ Немає доступних рахунків.")
             return
         
+        logger.debug(f"Accounts list: {accounts[:1]}")  # Debug: перший рахунок
+        
         # Отримати поточно обраний рахунок
         current_account_id = await user_preferences.get_preferred_account(chat_id)
         current_account_name = await user_preferences.get_preferred_account_name(chat_id)
@@ -1778,11 +1802,17 @@ async def _show_accounts_menu(chat_id: int, runtime) -> None:
         
         buttons = []
         for account in accounts:
+            # Firefly API format: id + attributes.name
             account_id = account.get("id")
-            account_name = account.get("name", "Unknown")
+            account_attrs = account.get("attributes", {})
+            account_name = account_attrs.get("name", "Unknown")
+            
+            if not account_id:
+                logger.warning(f"Account without ID: {account}")
+                continue
             
             # Позначити обраний рахунок
-            prefix = "✅ " if account_id == current_account_id else "  "
+            prefix = "✅ " if str(account_id) == str(current_account_id) else "  "
             
             buttons.append({
                 "text": f"{prefix}{account_name}",
