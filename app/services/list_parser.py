@@ -64,6 +64,14 @@ class ListParser:
         """Async version (для інтеграції з Vision API)."""
         return self.parse_list_image(image_bytes, media_type)
     
+    def parse_list_text(self, raw_text: str) -> Optional[Dict[str, Any]]:
+        """
+        Парсити текстовий список (з повідомлення користувача).
+        
+        Public wrapper для _parse_list_text.
+        """
+        return self._parse_list_text(raw_text)
+    
     def _extract_text_from_image(self, image_bytes: bytes, media_type: str) -> Optional[str]:
         """
         Витягти текст із скріншота (використати Vision API).

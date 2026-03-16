@@ -1469,6 +1469,33 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             await send_telegram_message(chat_id, "".join(lines))
             return {"ok": True}
 
+        # НОВЕ (Phase 7): Перевірити чи це структурований список покупок
+        if list_parser.is_list_format(text):
+            try:
+                parsed_list = list_parser.parse_list_text(text)
+                
+                if parsed_list and parsed_list.get('items'):
+                    # Обробити як список покупок (як receipt)
+                    # Використати обраний рахунок якщо є
+                    user_account = await _get_user_account(chat_id, runtime)
+                    parsed_list["source_account"] = user_account or runtime.default_source_account
+                    
+                    await pending_store.set(chat_id, "receipt_confirm", parsed_list)
+                    
+                    receipt_message = format_receipt_detailed(
+                        parsed_list,
+                        show_confidence=True,
+                        show_categories=False,  # У списку категорії вже правильні
+                    )
+                    
+                    logger.info(f"List detected and parsed for {chat_id}: {len(parsed_list.get('items', []))} items")
+                    await send_telegram_message(chat_id, receipt_message)
+                    return {"ok": True}
+            
+            except Exception as e:
+                logger.warning(f"Error parsing list: {str(e)}")
+                # Продовжити як звичайний текст
+        
         intent = await runtime.claude.parse_intent_text(text)
 
         if intent == "smalltalk":
