@@ -5,7 +5,7 @@ from difflib import SequenceMatcher
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
-SEED_VERSION = "2026-03-13-taxonomy-v1"
+SEED_VERSION = "2026-03-17-firefly-sync-v1"
 
 
 DEFAULT_CATEGORY_CATALOG: List[Dict[str, Any]] = [
@@ -242,11 +242,11 @@ DEFAULT_CATEGORY_CATALOG: List[Dict[str, Any]] = [
         "examples": ["оренда", "ОСББ", "електроенергія"],
     },
     {
-        "canonical_name": "Зв’язок та інтернет",
-        "description": "Мобільний зв'язок, домашній інтернет, поповнення номерів та тарифи операторів.",
+        "canonical_name": "Сервіси",
+        "description": "Мобільний зв’язок, домашній інтернет, поповнення номерів, тарифи операторів, будь-які послуги.",
         "aliases": [
-            "зв'язок та інтернет", "зв’язок та інтернет", "мобільний", "поповнення телефону", "домашній інтернет", "інтернет", "провайдер",
-            "kyivstar", "київстар", "lifecell", "лайфселл", "vodafone", "водафон"
+            "сервіси", "послуги", "сервіс", "мобільний", "поповнення телефону", "домашній інтернет", "інтернет", "провайдер",
+            "kyivstar", "київстар", "lifecell", "лайфселл", "vodafone", "водафон",
         ],
         "examples": ["Київстар", "домашній інтернет", "поповнення телефону"],
     },
@@ -292,6 +292,49 @@ DEFAULT_CATEGORY_CATALOG: List[Dict[str, Any]] = [
             "папір для творчості", "скрапбукінг"
         ],
         "examples": ["фарби", "нитки", "розмальовка"],
+    },
+    {
+        "canonical_name": "Їжа",
+        "description": "Готова їжа, обіди, вечері, сніданки — коли це їжа але не фастфуд і не продукти додому.",
+        "aliases": [
+            "їжа", "обід", "вечеря", "сніданок", "ланч", "готова їжа", "страва", "ділова їжа",
+        ],
+        "examples": ["обід", "вечеря", "ланч"],
+    },
+    {
+        "canonical_name": "Кава",
+        "description": "Кава у будь-якому вигляді: зерна, мелена, капсули, напій у кав'ярні.",
+        "aliases": [
+            "кава", "coffee", "americano", "американо", "espresso", "еспресо",
+            "cappuccino", "капучино", "latte", "лате", "flat white", "флет вайт",
+            "кава зерно", "кава мелена", "кава розчинна", "nescafe", "jacobs",
+        ],
+        "examples": ["капучино", "кава зерно", "американо"],
+    },
+    {
+        "canonical_name": "Косметика",
+        "description": "Декоративна косметика: помада, тіні, тональний крем, туш, пудра.",
+        "aliases": [
+            "косметика", "помада", "тіні", "тональний", "тональний крем", "туш", "пудра",
+            "блиск", "foundation", "лак для нігтів", "рум'яна", "хайлайтер", "контур",
+        ],
+        "examples": ["помада", "тіні", "тональний крем"],
+    },
+    {
+        "canonical_name": "Напої",
+        "description": "Напої у широкому сенсі — коли не ясно точний тип, або загальна категорія напоїв.",
+        "aliases": [
+            "напої", "drinks", "beverage", "beverages", "напій",
+        ],
+        "examples": ["напої", "drinks"],
+    },
+    {
+        "canonical_name": "Напитки",
+        "description": "Напитки — варіант написання напоїв, використовується як синонім.",
+        "aliases": [
+            "напитки", "напиток",
+        ],
+        "examples": ["напитки"],
     },
     {
         "canonical_name": "Інше",
@@ -470,6 +513,14 @@ class CategoryRulesService:
         self._load()
         with self._lock:
             meta = self._data.setdefault("meta", {})
+            catalog_names = {self._normalize(c["canonical_name"]) for c in DEFAULT_CATEGORY_CATALOG}
+            # Видалити категорії яких більше немає у каталозі
+            if meta.get("seed_version") != SEED_VERSION:
+                rules = self._data.get("rules", [])
+                self._data["rules"] = [
+                    r for r in rules
+                    if self._normalize(r.get("canonical_name", "")) in catalog_names
+                ]
             for category in DEFAULT_CATEGORY_CATALOG:
                 self._upsert_rule_unlocked(category["canonical_name"], category.get("aliases", []))
             meta["seed_version"] = SEED_VERSION
