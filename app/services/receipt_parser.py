@@ -61,6 +61,7 @@ class ReceiptParser:
         provider: str = "claude",  # НОВЕ: claude або openai
         openai_api_key: Optional[str] = None,  # НОВЕ: для OpenAI
         openai_model: str = "gpt-4o-mini",  # НОВЕ: модель OpenAI
+        claude_parser=None,  # ClaudeParser для розумної категоризації
     ) -> None:
         self.api_key = api_key  # Claude API key
         self.model = model  # Claude model
@@ -74,6 +75,8 @@ class ReceiptParser:
         self.openai_model = openai_model
         self.openai_api_url = "https://api.openai.com/v1/chat/completions"
         
+        self.claude_parser = claude_parser
+
         # ФАЗА 3: Пам'ять і нормалізація
         self.memory = ReceiptMemory()
         self.normalizer = ReceiptNormalizer(
@@ -411,6 +414,38 @@ class ReceiptParser:
             raise ValueError(f"Claude повернув не JSON для чека: {raw_text}") from e
 
         normalized = self._normalize_receipt(parsed)
+
+        # Розумна категоризація через Claude для позицій що не вдалося визначити
+        if self.claude_parser:
+            unresolved = [
+                item for item in normalized["items"]
+                if item.get("category") == "Інше"
+            ]
+            if unresolved:
+                claude_results = await self.claude_parser.categorize_receipt_items(
+                    merchant=normalized["merchant"],
+                    items=[{"name": item["name"]} for item in unresolved],
+                )
+                for item, claude_result in zip(unresolved, claude_results):
+                    if not claude_result:
+                        continue
+                    category = claude_result.get("category", "Інше")
+                    confidence = claude_result.get("confidence", 0.0)
+                    item["category"] = category
+                    item["category_confidence"] = confidence
+                    # Auto-save до пам'яті якщо Claude впевнений
+                    if confidence >= 0.85:
+                        self.memory.save_confirmation(
+                            merchant=normalized["merchant"],
+                            raw_name=item["raw_name"],
+                            normalized_name=item["name"],
+                            category=category,
+                        )
+                # Перерахувати підсумки по категоріях
+                normalized["category_totals"] = self._aggregate_category_totals(
+                    normalized["items"]
+                )
+
         print("PARSED_RECEIPT =", json.dumps(normalized, ensure_ascii=False))
         return normalized
     

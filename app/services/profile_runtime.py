@@ -91,6 +91,7 @@ class ProfileRuntimeFactory:
             model=self.claude_model,
             default_currency=default_currency,
             category_rules=category_rules,
+            claude_parser=claude,
         )
 
         reminder_service = ReminderService(

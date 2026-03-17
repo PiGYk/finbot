@@ -346,9 +346,10 @@ def build_profile_runtime(profile: dict[str, Any]) -> ProfileRuntime:
         model=CLAUDE_MODEL,
         default_currency=default_currency,
         category_rules=category_rules,
-        provider=RECEIPT_OCR_PROVIDER,  # НОВЕ: claude або openai
-        openai_api_key=OPENAI_API_KEY,  # НОВЕ: для OpenAI Vision
-        openai_model=RECEIPT_OCR_MODEL_OPENAI,  # НОВЕ: gpt-4o-mini
+        provider=RECEIPT_OCR_PROVIDER,
+        openai_api_key=OPENAI_API_KEY,
+        openai_model=RECEIPT_OCR_MODEL_OPENAI,
+        claude_parser=claude,
     )
 
     receipt_enhancer = ReceiptEnhancer(
@@ -447,9 +448,10 @@ def get_default_runtime() -> ProfileRuntime:
         model=CLAUDE_MODEL,
         default_currency=DEFAULT_CURRENCY,
         category_rules=category_rules,
-        provider=RECEIPT_OCR_PROVIDER,  # НОВЕ: claude або openai
-        openai_api_key=OPENAI_API_KEY,  # НОВЕ: для OpenAI Vision
-        openai_model=RECEIPT_OCR_MODEL_OPENAI,  # НОВЕ: gpt-4o-mini
+        provider=RECEIPT_OCR_PROVIDER,
+        openai_api_key=OPENAI_API_KEY,
+        openai_model=RECEIPT_OCR_MODEL_OPENAI,
+        claude_parser=claude,
     )
 
     receipt_enhancer = ReceiptEnhancer(

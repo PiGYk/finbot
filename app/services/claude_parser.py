@@ -1181,6 +1181,59 @@ class ClaudeParser:
         parsed = await self._call_claude_json(prompt, max_tokens=320)
         return normalize_subscription_manage(parsed, default_currency=self.default_currency)
 
+    async def categorize_receipt_items(
+        self,
+        merchant: str,
+        items: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Категоризувати позиції чека за допомогою Claude.
+
+        Claude отримує назву магазину + всі позиції як контекст і повертає
+        категорію + confidence для кожної. Не використовує статичний список —
+        Claude сам визначає найточнішу категорію.
+        """
+        if not items:
+            return []
+
+        items_lines = "\n".join(
+            f"{i + 1}. {item['name']}" for i, item in enumerate(items)
+        )
+
+        prompt = f"""Ти категоризатор позицій касового чека. Поверни СУВОРО лише JSON масив без markdown.
+
+Магазин: {merchant}
+
+Позиції для категоризації:
+{items_lines}
+
+Правила:
+- Категоризуй кожну позицію максимально СПЕЦИФІЧНО
+- Використовуй зрозумілі українські назви категорій
+- НЕ використовуй "Інше" якщо можна визначити точніше
+- Враховуй контекст магазину та інших позицій
+
+Приклади категорій (не обмежуйся ними, обирай найточнішу):
+Продукти, Овочі та фрукти, М'ясо та риба, Молочні продукти, Хліб та випічка,
+Алкоголь, Цигарки, Енергетики, Солодкі напої, Вода,
+Фастфуд і снеки, Солодощі, Кафе та ресторани,
+Гігієна та догляд, Побутова хімія, Товари для дому,
+Аптека, Тварини, Одяг, Техніка, Пальне, Транспорт
+
+Поверни масив у тому самому порядку що й вхідні позиції:
+[
+  {{"name": "назва з входу", "category": "категорія", "confidence": 0.95}},
+  ...
+]"""
+
+        try:
+            result = await self._call_claude_json(prompt, max_tokens=1500)
+            if isinstance(result, list):
+                return result
+            return []
+        except Exception:
+            return []
+
     async def answer_smalltalk(self, user_text: str) -> str:
         prompt = f"""
 Ти Telegram-бот з фінансовим ухилом.
