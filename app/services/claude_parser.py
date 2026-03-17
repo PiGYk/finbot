@@ -1181,6 +1181,31 @@ class ClaudeParser:
         parsed = await self._call_claude_json(prompt, max_tokens=320)
         return normalize_subscription_manage(parsed, default_currency=self.default_currency)
 
+    async def resolve_user_category(self, user_text: str, item_name: str, merchant: str) -> str:
+        """
+        Перетворює вільний текст юзера у назву категорії.
+        Розуміє помилки, скорочення, сленг.
+        """
+        prompt = f"""Юзер хоче встановити категорію для позиції з чека.
+Магазин: {merchant}
+Позиція: {item_name}
+Юзер написав: {user_text}
+
+Визнач яку категорію мав на увазі юзер. Поверни СУВОРО лише JSON без markdown.
+{{"category": "точна назва категорії"}}
+
+Правила:
+- Якщо юзер написав скорочення або з помилкою — зрозумій і виправ
+- Повертай нормальну людську назву категорії українською
+- Приклади: "напої" → "Солодкі напої", "жрак" → "Продукти", "куриво" → "Цигарки", "бухло" → "Алкоголь"
+- Якщо зовсім незрозуміло — використай "{user_text}" як є"""
+
+        try:
+            result = await self._call_claude_json(prompt, max_tokens=60)
+            return str(result.get("category", user_text)).strip() or user_text
+        except Exception:
+            return user_text
+
     async def categorize_receipt_items(
         self,
         merchant: str,

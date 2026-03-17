@@ -93,6 +93,7 @@ _bootstrap_lock: Optional[asyncio.Lock] = None
 
 # НОВЕ: Зберігання останніх скасованих операцій для undo
 last_cancelled: dict[int, dict] = {}
+receipt_category_edit: dict[int, dict] = {}  # chat_id -> {"item_index": int, "item_name": str}
 last_deleted_transaction: dict[int, dict] = {}  # Для undo видалених транзакцій
 
 
@@ -717,6 +718,34 @@ def format_last_transaction_action_result(result: dict, default_currency: str) -
     return "Невідомий результат дії над останньою транзакцією."
 
 
+def build_receipt_keyboard(receipt: dict) -> dict:
+    """Inline-клавіатура для підтвердження чека: кнопка на кожну позицію + підтвердити/скасувати."""
+    items = receipt.get("items", [])
+    buttons = []
+    for i, item in enumerate(items):
+        name = item.get("name") or item.get("raw_name") or f"Позиція {i + 1}"
+        short = (name[:16] + "…") if len(name) > 18 else name
+        buttons.append({"text": short, "callback_data": f"receipt_item:{i}"})
+
+    keyboard = []
+    for i in range(0, len(buttons), 2):
+        keyboard.append(buttons[i : i + 2])
+    keyboard.append([
+        {"text": "✅ Підтвердити", "callback_data": "receipt_confirm"},
+        {"text": "❌ Скасувати", "callback_data": "receipt_cancel"},
+    ])
+    return {"inline_keyboard": keyboard}
+
+
+def _get_runtime_for_chat(chat_id: int):
+    """Повертає runtime незалежно від режиму (profiles / single)."""
+    if profiles_enabled():
+        bound = get_bound_profile_id(chat_id)
+        if bound:
+            return get_profile_runtime(bound)
+    return get_default_runtime()
+
+
 def format_receipt_preview(receipt: dict, default_currency: str) -> str:
     merchant = receipt.get("merchant") or "Чек"
     currency = receipt.get("currency") or default_currency
@@ -960,6 +989,84 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
 
     update = await request.json()
 
+    callback_query = update.get("callback_query")
+    if callback_query:
+        callback_id = callback_query.get("id")
+        data = callback_query.get("data", "")
+        cb_message = callback_query.get("message", {})
+        cb_chat = cb_message.get("chat", {})
+        chat_id = cb_chat.get("id")
+        message_id = cb_message.get("message_id")
+
+        if callback_id:
+            await answer_callback_query(callback_id)
+
+        if not chat_id:
+            return {"ok": True}
+
+        # Receipt inline-keyboard callbacks (працює і без профілів)
+        if data in ("receipt_confirm", "receipt_cancel") or data.startswith("receipt_item:"):
+            cb_runtime = _get_runtime_for_chat(chat_id)
+            await ensure_runtime_bootstrapped(cb_runtime)
+
+            if data == "receipt_confirm":
+                pending = await pending_store.get(chat_id)
+                if pending and pending.get("kind") == "receipt_confirm":
+                    receipt_category_edit.pop(chat_id, None)
+                    receipt = pending["payload"]
+                    source_account = await _get_user_account(chat_id, cb_runtime)
+                    result = await cb_runtime.firefly.create_receipt_transactions(
+                        receipt=receipt,
+                        default_source_account=source_account,
+                        default_currency=cb_runtime.default_currency,
+                    )
+                    await pending_store.clear(chat_id)
+                    if message_id:
+                        await edit_telegram_message(
+                            chat_id, message_id,
+                            format_receipt_commit_result(receipt, result, cb_runtime.default_currency),
+                        )
+                    else:
+                        await send_telegram_message(
+                            chat_id,
+                            format_receipt_commit_result(receipt, result, cb_runtime.default_currency),
+                        )
+                return {"ok": True}
+
+            if data == "receipt_cancel":
+                pending = await pending_store.get(chat_id)
+                if pending and pending.get("kind") == "receipt_confirm":
+                    last_cancelled[chat_id] = pending.copy()
+                    await pending_store.clear(chat_id)
+                receipt_category_edit.pop(chat_id, None)
+                if message_id:
+                    await edit_telegram_message(
+                        chat_id, message_id,
+                        "Окей, чек скасовано.\n\n💡 Якщо передумав — напиши «поверни назад».",
+                    )
+                return {"ok": True}
+
+            if data.startswith("receipt_item:"):
+                try:
+                    item_index = int(data.split(":", 1)[1])
+                except (ValueError, IndexError):
+                    return {"ok": True}
+                pending = await pending_store.get(chat_id)
+                if not pending or pending.get("kind") != "receipt_confirm":
+                    return {"ok": True}
+                items = pending["payload"].get("items", [])
+                if item_index >= len(items):
+                    return {"ok": True}
+                item = items[item_index]
+                item_name = item.get("name") or item.get("raw_name") or f"Позиція {item_index + 1}"
+                current_category = item.get("category", "Інше")
+                receipt_category_edit[chat_id] = {"item_index": item_index, "item_name": item_name}
+                await send_telegram_message(
+                    chat_id,
+                    f"Зараз: «{item_name}» → {current_category}\n\nЯку категорію поставити?",
+                )
+                return {"ok": True}
+
     if profiles_enabled():
         callback_query = update.get("callback_query")
         if callback_query:
@@ -969,9 +1076,6 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             chat = message.get("chat", {})
             chat_id = chat.get("id")
             message_id = message.get("message_id")
-
-            if callback_id:
-                await answer_callback_query(callback_id)
 
             if not chat_id or not message_id:
                 return {"ok": True}
@@ -1102,7 +1206,37 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                 return {"ok": True}
 
             if not text:
-                await send_telegram_message(chat_id, "Напиши «підтвердити чек» або «скасувати чек».")
+                await send_telegram_message(chat_id, "Натисни кнопку або напиши «підтвердити чек» / «скасувати чек».")
+                return {"ok": True}
+
+            # Юзер відповідає на запит про категорію для конкретної позиції
+            if chat_id in receipt_category_edit and not is_receipt_confirm_text(text) and not is_receipt_cancel_text(text):
+                edit_state = receipt_category_edit.pop(chat_id)
+                item_index = edit_state["item_index"]
+                item_name = edit_state["item_name"]
+                receipt = pending["payload"]
+                items = receipt.get("items", [])
+                if item_index < len(items):
+                    resolved = await runtime.claude.resolve_user_category(
+                        user_text=text,
+                        item_name=item_name,
+                        merchant=receipt.get("merchant", ""),
+                    )
+                    items[item_index]["category"] = resolved
+                    runtime.receipt_parser.save_item_confirmation(
+                        merchant=receipt.get("merchant", ""),
+                        raw_name=items[item_index].get("raw_name", item_name),
+                        confirmed_name=item_name,
+                        confirmed_category=resolved,
+                    )
+                    receipt["category_totals"] = runtime.receipt_parser._aggregate_category_totals(items)
+                    await pending_store.set(chat_id, "receipt_confirm", receipt)
+                    receipt_message = format_receipt_detailed(receipt, show_categories=True, show_confidence=False)
+                    await send_telegram_message(
+                        chat_id,
+                        f"✅ «{item_name}» → {resolved}\n\n" + receipt_message,
+                        reply_markup=build_receipt_keyboard(receipt),
+                    )
                 return {"ok": True}
 
             if is_receipt_confirm_text(text):
@@ -1172,9 +1306,13 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
             receipt_message = format_receipt_detailed(
                 parsed_receipt,
                 show_categories=True,
-                show_confidence=False  # На production = False
+                show_confidence=False,
             )
-            await send_telegram_message(chat_id, receipt_message)
+            await send_telegram_message(
+                chat_id,
+                receipt_message,
+                reply_markup=build_receipt_keyboard(parsed_receipt),
+            )
             return {"ok": True}
 
         # НОВЕ: Меню обраних рахунків
@@ -1307,7 +1445,8 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                     receipt_message = format_receipt_detailed(receipt, show_categories=True)
                     await send_telegram_message(
                         chat_id,
-                        f"✅ Відновив чек!\n\n{receipt_message}"
+                        f"✅ Відновив чек!\n\n{receipt_message}",
+                        reply_markup=build_receipt_keyboard(receipt),
                     )
                 else:
                     await send_telegram_message(
@@ -1487,11 +1626,15 @@ async def telegram_webhook(secret: str, request: Request) -> dict:
                     receipt_message = format_receipt_detailed(
                         parsed_list,
                         show_confidence=True,
-                        show_categories=False,  # У списку категорії вже правильні
+                        show_categories=False,
                     )
-                    
+
                     logger.info(f"List detected and parsed for {chat_id}: {len(parsed_list.get('items', []))} items")
-                    await send_telegram_message(chat_id, receipt_message)
+                    await send_telegram_message(
+                        chat_id,
+                        receipt_message,
+                        reply_markup=build_receipt_keyboard(parsed_list),
+                    )
                     return {"ok": True}
             
             except Exception as e:
