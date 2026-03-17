@@ -5,7 +5,7 @@ from difflib import SequenceMatcher
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
-SEED_VERSION = "2026-03-17-firefly-sync-v1"
+SEED_VERSION = "2026-03-17-firefly-sync-v2"
 
 
 DEFAULT_CATEGORY_CATALOG: List[Dict[str, Any]] = [
@@ -294,14 +294,6 @@ DEFAULT_CATEGORY_CATALOG: List[Dict[str, Any]] = [
         "examples": ["фарби", "нитки", "розмальовка"],
     },
     {
-        "canonical_name": "Їжа",
-        "description": "Готова їжа, обіди, вечері, сніданки — коли це їжа але не фастфуд і не продукти додому.",
-        "aliases": [
-            "їжа", "обід", "вечеря", "сніданок", "ланч", "готова їжа", "страва", "ділова їжа",
-        ],
-        "examples": ["обід", "вечеря", "ланч"],
-    },
-    {
         "canonical_name": "Кава",
         "description": "Кава у будь-якому вигляді: зерна, мелена, капсули, напій у кав'ярні.",
         "aliases": [
@@ -319,22 +311,6 @@ DEFAULT_CATEGORY_CATALOG: List[Dict[str, Any]] = [
             "блиск", "foundation", "лак для нігтів", "рум'яна", "хайлайтер", "контур",
         ],
         "examples": ["помада", "тіні", "тональний крем"],
-    },
-    {
-        "canonical_name": "Напої",
-        "description": "Напої у широкому сенсі — коли не ясно точний тип, або загальна категорія напоїв.",
-        "aliases": [
-            "напої", "drinks", "beverage", "beverages", "напій",
-        ],
-        "examples": ["напої", "drinks"],
-    },
-    {
-        "canonical_name": "Напитки",
-        "description": "Напитки — варіант написання напоїв, використовується як синонім.",
-        "aliases": [
-            "напитки", "напиток",
-        ],
-        "examples": ["напитки"],
     },
     {
         "canonical_name": "Інше",
